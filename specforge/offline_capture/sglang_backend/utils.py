@@ -28,6 +28,7 @@ def replaced_logits_processor_forward_for_offline_eagle3(
     logits_metadata,
     aux_hidden_states: Optional[list[torch.Tensor]] = None,
     hidden_states_before_norm: Optional[torch.Tensor] = None,
+    prefer_aux_hidden_states: bool = False,
 ):
     """Return full auxiliary/final states while skipping the LM-head projection."""
 
@@ -72,16 +73,23 @@ def replaced_logits_processor_forward_for_offline_eagle3(
         aux_hidden_states,
         logits_metadata,
     )
-    states_to_store = logits_processor._get_hidden_states_to_store(
-        hidden_states,
-        hidden_states_before_norm,
-        aux_hidden_states,
-        pruned_states,
-        pruned_states_before_norm,
-        aux_pruned_states,
-        sample_indices,
-        logits_metadata,
-    )
+    if prefer_aux_hidden_states and aux_hidden_states is not None:
+        assert aux_pruned_states is not None
+        # SGLang prefers hidden_states_before_norm over auxiliary states. For
+        # DeepSeek-V4 that tensor is the flattened mHC stream [tokens, 4H], not
+        # the configured target-layer captures needed by offline training.
+        states_to_store = torch.cat(aux_pruned_states, dim=-1)
+    else:
+        states_to_store = logits_processor._get_hidden_states_to_store(
+            hidden_states,
+            hidden_states_before_norm,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
     if logits_metadata.extend_return_logprob:
         raise RuntimeError("Offline EAGLE3 capture does not support log probabilities")
     return OfflineEagle3LogitsOutput(
@@ -94,9 +102,15 @@ def replaced_logits_processor_forward_for_offline_eagle3(
 class OfflineEagle3LogitsProcessor(nn.Module):
     """SGLang logits processor that returns hidden states and computes no logits."""
 
-    def __init__(self, logits_processor: LogitsProcessor) -> None:
+    def __init__(
+        self,
+        logits_processor: LogitsProcessor,
+        *,
+        prefer_aux_hidden_states: bool = False,
+    ) -> None:
         super().__init__()
         self.logits_processor = logits_processor
+        self.prefer_aux_hidden_states = prefer_aux_hidden_states
 
     def forward(
         self,
@@ -118,10 +132,15 @@ class OfflineEagle3LogitsProcessor(nn.Module):
             logits_metadata,
             aux_hidden_states,
             hidden_states_before_norm,
+            prefer_aux_hidden_states=self.prefer_aux_hidden_states,
         )
 
 
-def wrap_offline_eagle3_logits_processors(module: nn.Module) -> None:
+def wrap_offline_eagle3_logits_processors(
+    module: nn.Module,
+    *,
+    prefer_aux_hidden_states: bool = False,
+) -> None:
     """Replace each SGLang logits processor with the offline capture variant."""
 
     replacements = [
@@ -136,7 +155,14 @@ def wrap_offline_eagle3_logits_processors(module: nn.Module) -> None:
             raise RuntimeError("The target model itself cannot be a logits processor")
         parent_name, _, child_name = name.rpartition(".")
         parent = module.get_submodule(parent_name) if parent_name else module
-        setattr(parent, child_name, OfflineEagle3LogitsProcessor(submodule))
+        setattr(
+            parent,
+            child_name,
+            OfflineEagle3LogitsProcessor(
+                submodule,
+                prefer_aux_hidden_states=prefer_aux_hidden_states,
+            ),
+        )
 
 
 __all__ = [

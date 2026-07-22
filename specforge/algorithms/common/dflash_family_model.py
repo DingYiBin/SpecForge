@@ -43,7 +43,15 @@ def compute_accept_len(
     return accept_prefix.sum(dim=2).float()
 
 
-def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, device):
+def create_dflash_sdpa_mask(
+    anchor_positions,
+    block_keep_mask,
+    S,
+    block_size,
+    device,
+    context_window=None,
+    include_anchor_context=False,
+):
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
     KV_LEN = S + N * block_size
@@ -59,7 +67,17 @@ def create_dflash_sdpa_mask(anchor_positions, block_keep_mask, S, block_size, de
         block_size, dim=2
     )
 
-    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
+    context_bound = (
+        kv_indices <= anchor_expanded
+        if include_anchor_context
+        else kv_indices < anchor_expanded
+    )
+    mask_context = (kv_indices < S) & context_bound
+    if context_window is not None:
+        first_context = anchor_expanded - int(context_window)
+        if include_anchor_context:
+            first_context = first_context + 1
+        mask_context = mask_context & (kv_indices >= first_context)
 
     is_draft = kv_indices >= S
     kv_block_ids = (kv_indices - S) // block_size
@@ -77,6 +95,8 @@ def create_dflash_block_mask(
     S: int,
     block_size: int,
     device: torch.device,
+    context_window: Optional[int] = None,
+    include_anchor_context: bool = False,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -84,7 +104,8 @@ def create_dflash_block_mask(
     Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
 
     Rules:
-      1. Each block sees context strictly before its anchor (kv_idx < anchor_pos).
+      1. Each block sees the configured context window before its anchor; models
+         may additionally include the anchor position.
       2. Intra-block attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
@@ -96,9 +117,15 @@ def create_dflash_block_mask(
         anchor_pos = anchor_positions[b, safe_q_block_id]
 
         is_context = kv_idx < S
-        # Strictly less than: matches inference where target_hidden[anchor_pos]
-        # is not available as context.
-        mask_context = is_context & (kv_idx < anchor_pos)
+        context_bound = (
+            kv_idx <= anchor_pos if include_anchor_context else kv_idx < anchor_pos
+        )
+        mask_context = is_context & context_bound
+        if context_window is not None:
+            first_context = anchor_pos - int(context_window)
+            if include_anchor_context:
+                first_context = first_context + 1
+            mask_context = mask_context & (kv_idx >= first_context)
 
         is_draft = kv_idx >= S
         kv_block_id = (kv_idx - S) // block_size
@@ -289,6 +316,10 @@ class OnlineDFlashModel(nn.Module):
                 S=seq_len,
                 block_size=self.block_size,
                 device=device,
+                context_window=getattr(self.draft_model, "context_window", None),
+                include_anchor_context=getattr(
+                    self.draft_model, "include_anchor_context", False
+                ),
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
@@ -297,6 +328,10 @@ class OnlineDFlashModel(nn.Module):
                 S=seq_len,
                 block_size=self.block_size,
                 device=device,
+                context_window=getattr(self.draft_model, "context_window", None),
+                include_anchor_context=getattr(
+                    self.draft_model, "include_anchor_context", False
+                ),
             )
 
         output_hidden = self.draft_model(
@@ -886,6 +921,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         ce_loss_den = flat_weights.sum()
         ce_loss = (loss_per_token * flat_weights).sum() / (ce_loss_den + 1e-6)
+        loss_per_position = loss_per_token.reshape_as(target_ids)
+
+        position_metrics = {}
+        for position in range(self.block_size):
+            position_weights = loss_weight_mask[..., position]
+            position_loss = (
+                loss_per_position[..., position] * position_weights
+            ).sum() / (position_weights.sum() + 1e-6)
+            position_metrics[f"mtp_{position + 1}_loss"] = position_loss.detach()
 
         l1_loss = ce_loss.new_zeros(())
         accept_rate_3d = None
@@ -938,6 +982,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             "l1_loss": l1_loss.detach(),
             "confidence_loss": confidence_loss.detach(),
             "confidence_abs_error": confidence_abs_error.detach(),
+            **position_metrics,
         }
         return loss, metrics
 

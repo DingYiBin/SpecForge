@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -35,6 +36,16 @@ class OfflineEagle3SGLangCapture:
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "OfflineEagle3SGLangCapture":
+        force_cuda_norm = bool(kwargs.pop("_force_cuda_norm", False))
+        if force_cuda_norm:
+            # FlashInfer's CuTe RMSNorm fails to compile for DeepSeek-V4 on the
+            # pinned CUDA stack. Its CUDA implementation is supported there.
+            os.environ["FLASHINFER_USE_CUDA_NORM"] = "1"
+
+            # SGLang may have imported FlashInfer before this boundary.
+            import flashinfer.norm as flashinfer_norm
+
+            flashinfer_norm._USE_CUDA_NORM = True
         from .sglang_backend import OfflineSGLangCaptureBackend
 
         backend = OfflineSGLangCaptureBackend.build(
