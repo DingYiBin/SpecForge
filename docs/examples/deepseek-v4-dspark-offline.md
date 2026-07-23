@@ -58,3 +58,34 @@ The DSv4 loader reads only `mtp.*` tensors from the full HF checkpoint. Packed
 FP4 expert tensors and FP8 tensors are dequantized to the configured training
 dtype while loading. The checkpoint, tokenizer, captured layer IDs, and hidden
 state convention must come from the same model release.
+
+## Train on Ascend NPU
+
+DeepSeek-V4 DSpark attention hard-requires `flex_attention` on the CUDA path,
+which is unavailable on Ascend NPU. Set `attention_backend: sdpa` to select the
+dense fallback (`DeepseekV4DSparkAttention._dense_attention`): it consumes the
+boolean mask from `create_dflash_sdpa_mask` with no Q/KV length constraint, and
+splits the softmax at the `[context | draft]` boundary so the block-diagonal
+draft region is computed as `N` independent `bs x bs` attentions instead of the
+wasteful full `Q x Q` product. The learned attention sink reuses the same
+logsumexp as a sigmoid gate, matching the flex path numerically.
+
+A ready-made recipe is
+[`examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml).
+Install the vendor-matched PyTorch and `torch_npu` packages first, then launch:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=7200
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+specforge train -c examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml
+```
+
+The runtime auto-detects NPU via `torch.npu.is_available()` (or honor
+`SPECFORGE_DEVICE=npu`). The `prepare_hidden_states.py` capture step is a
+separate SGLang-backed pipeline; run it on an NPU-compatible SGLang service
+(or capture on CUDA and point `data.hidden_states_path` at the exported
+features) before training.
+

@@ -1,0 +1,35 @@
+model:
+  target_model_path: /path/to/DeepSeek-V4-Flash-DSpark
+  draft_model_config: configs/deepseek-v4-flash-dspark.json
+  draft_checkpoint_path: /path/to/DeepSeek-V4-Flash-DSpark
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: /path/to/dspark-hidden-states
+  max_length: 4096
+
+training:
+  strategy: dspark
+  # Ascend NPU has no flex_attention; sdpa selects the dense block-diagonal
+  # attention path in DeepseekV4DSparkAttention (see _dense_attention).
+  attention_backend: sdpa
+  batch_size: 1
+  num_anchors: 512
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+run_id: deepseek-v4-dspark-npu-offline
+output_dir: ./outputs/deepseek-v4-dspark-npu-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
