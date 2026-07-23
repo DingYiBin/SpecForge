@@ -247,6 +247,7 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.num_heads = int(config.num_attention_heads)
         self.head_dim = int(config.head_dim)
         self.scaling = self.head_dim**-0.5
+        self.block_size = int(_method_config(config).get("block_size", 0))
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
@@ -269,6 +270,135 @@ class DeepseekV4DSparkAttention(nn.Module):
             bias=False,
         )
         self.attn_sink = nn.Parameter(torch.empty(self.num_heads))
+
+    # ----------------------------------------------------------------------
+    # Future optimization opportunity (dense-anchor / whole-response loss)
+    # ----------------------------------------------------------------------
+    # Planned change: stop sampling a sparse set of anchors and instead put
+    # the whole response into the loss -- i.e. every response token becomes an
+    # anchor (N = response length R). Two structural consequences:
+    #
+    # 1. The context mask becomes *causal*: query at position a attends to
+    #    context [0..a]. That is a standard lower-triangular causal mask,
+    #    which fused kernels support natively -- including on Ascend NPU via
+    #    ``F.scaled_dot_product_attention(..., is_causal=True)``. The causal
+    #    path is the well-supported one on NPU (unlike arbitrary user masks),
+    #    so the context segment could switch from the dense ``Q x S`` matmul
+    #    to a fused causal kernel, dropping the custom context mask entirely.
+    #
+    # 2. The draft segment degenerates:
+    #    - If ``block_size`` also collapses to 1 (one-token "blocks"), the
+    #      draft-draft region becomes a 1x1 self-attention per position. With
+    #      ``include_anchor_context=True`` each query already attends to
+    #      itself via the context, so the draft segment is fully redundant and
+    #      the whole split-softmax below can be removed -- attention reduces to
+    #      plain causal (± sliding_window) over the full sequence. That removes
+    #      BOTH the custom-mask problem and the Q != KV problem that forced us
+    #      off fused SDPA in the first place, enabling a single fused
+    #      causal/flash call (with sliding window if supported).
+    #    - If ``block_size`` stays > 1, the block-diagonal structure is
+    #      preserved so the split-softmax here remains valid and beneficial;
+    #      but Q grows to R*block_size, so the context chunk loop is mandatory
+    #      and the context part should still move to a fused causal kernel.
+    #
+    # 3. The learned attention sink still needs the per-query logsumexp. A
+    #    fused flash/causal kernel can return LSE directly (``return_lse`` or
+    #    equivalent), so the separate scores matmul for the sink can be dropped
+    #    as well -- the sink gate becomes a cheap post-pass on kernel LSE.
+    #
+    # 4. ``sliding_window`` (128) turns the causal mask into causal+window
+    #    (a band mask); many fused backends support this natively, otherwise it
+    #    stays a cheap additive band mask on top of the causal kernel.
+    #
+    # Net: dense anchors let the NPU path collapse from "custom dense mask +
+    # split-softmax + chunked manual matmul" to "one fused causal/flash call +
+    # LSE-based sink gate", which is both simpler and dramatically faster.
+    # Not implemented yet -- left as a comment per plan.
+    # ----------------------------------------------------------------------
+    def _dense_attention(
+        self,
+        query: torch.Tensor,
+        kv: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        chunk: int = 256,
+    ) -> torch.Tensor:
+        """Manual dense-mask attention for devices without flex_attention.
+
+        Used on Ascend NPU, where ``F.scaled_dot_product_attention`` cannot be
+        relied on for a custom dense boolean mask with ``Q_LEN != KV_LEN``.
+        This path is plain matmul/softmax, so it imposes no Q/KV length
+        constraint and no mask-format constraint.  It also returns the
+        logsumexp needed by the learned attention sink.
+
+        ``attention_mask`` is the boolean tensor from ``create_dflash_sdpa_mask``
+        with shape ``(B, 1, Q, KV)`` (``True`` = attend); ``KV = S + N*bs`` and
+        ``Q = N*bs``.  The draft-draft region of the mask is block-diagonal: each
+        query block attends only to its own ``bs`` draft tokens, so computing
+        the full ``Q*KV`` scores wastes the off-diagonal ``Q*Q`` block.  We split
+        the softmax into a context part (``Q x S``, chunked over Q) and a draft
+        part (``N`` independent ``bs x bs`` blocks) and merge them exactly via
+        ``output = (o_ctx + o_draft) / (Z_ctx + Z_draft)``,
+        ``lse = log(Z_ctx + Z_draft)``.  Shared-KV MLA uses ``kv`` as both keys
+        and values, broadcast from one head to all query heads.
+        """
+        mask = attention_mask.bool()
+        B, H, Q, d = query.shape
+        KV = kv.shape[2]
+        S = KV - Q
+        bs = self.block_size
+        N = Q // bs
+        kv_f = kv.float()
+        neg = torch.finfo(torch.float32).min
+        tiny = torch.finfo(torch.float32).tiny
+
+        # --- Part A: context attention (Q x S), chunked over Q ---
+        # Use stable softmax/logsumexp per chunk; derive the unnormalised
+        # output o_ctx = Z_ctx * (softmax @ V) so the merge is exact.
+        kv_ctx = kv_f[:, :, :S, :]                  # (B, 1, S, d)
+        kv_ctx_t = kv_ctx.transpose(-1, -2)         # (B, 1, d, S)
+        o_ctx_parts, z_ctx_parts = [], []
+        for start in range(0, Q, chunk):
+            q_chunk = query[:, :, start : start + chunk].float()   # (B, H, c, d)
+            m_ctx = mask[:, :, start : start + chunk, :S]           # (B, 1, c, S)
+            scores = torch.matmul(q_chunk, kv_ctx_t) * self.scaling  # (B, H, c, S)
+            scores = scores.masked_fill(~m_ctx, neg)
+            lse_c = torch.logsumexp(scores, dim=-1)                # (B, H, c)
+            attn = torch.softmax(scores, dim=-1)                   # (B, H, c, S)
+            z_ctx_parts.append(torch.exp(lse_c))                   # Z_ctx
+            o_ctx_parts.append(
+                torch.exp(lse_c).unsqueeze(-1) * torch.matmul(attn, kv_ctx)
+            )
+        o_ctx = torch.cat(o_ctx_parts, dim=2)                        # (B, H, Q, d)
+        z_ctx = torch.cat(z_ctx_parts, dim=-1)                       # (B, H, Q)
+
+        # --- Part B: draft block-diagonal attention (N x bs x bs) ---
+        # Per-block diagonal mask: all-True for valid blocks, all-False otherwise.
+        m_draft_full = mask[:, :, :Q, S:]                            # (B, 1, Q, Q)
+        m_diag = m_draft_full.reshape(B, 1, N, bs, N, bs).diagonal(dim1=2, dim2=4)
+        m_diag = m_diag.permute(0, 1, 4, 2, 3).contiguous()           # (B, 1, N, bs, bs)
+        q_blocks = query.reshape(B, H, N, bs, d).float()             # (B, H, N, bs, d)
+        kv_draft = kv_f[:, :, S : S + N * bs, :].reshape(B, 1, N, bs, d)
+        kv_draft_exp = kv_draft.expand(B, H, N, bs, d)
+        scores_d = torch.matmul(q_blocks, kv_draft_exp.transpose(-1, -2)) * self.scaling
+        scores_d = scores_d.masked_fill(~m_diag, neg)                 # (B, H, N, bs, bs)
+        lse_d = torch.logsumexp(scores_d, dim=-1)                    # (B, H, N, bs)
+        attn_d = torch.softmax(scores_d, dim=-1)                     # (B, H, N, bs, bs)
+        z_draft = torch.exp(lse_d)                                   # (B, H, N, bs)
+        o_draft = z_draft.unsqueeze(-1) * torch.matmul(attn_d, kv_draft_exp)
+
+        # --- Exact merge of the two softmax segments ---
+        z_ctx_blk = z_ctx.reshape(B, H, N, bs)
+        o_ctx_blk = o_ctx.reshape(B, H, N, bs, d)
+        z_total = z_ctx_blk + z_draft                                # (B, H, N, bs)
+        output = (o_ctx_blk + o_draft) / z_total.clamp_min(tiny).unsqueeze(-1)
+        output = output.reshape(B, H, Q, d).to(query.dtype)
+        lse = torch.log(z_total.clamp_min(tiny)).reshape(B, H, Q)
+
+        sink_scale = torch.sigmoid(
+            lse - self.attn_sink.float().view(1, -1, 1)
+        ).to(output.dtype)
+        return output * sink_scale.unsqueeze(-1)
 
     def _attention(
         self,
@@ -294,9 +424,13 @@ class DeepseekV4DSparkAttention(nn.Module):
             ).to(output.dtype)
             return output * sink_scale.unsqueeze(-1)
 
+        if isinstance(attention_mask, torch.Tensor):
+            return self._dense_attention(query, kv, attention_mask)
+
         raise ValueError(
-            "DeepSeek-V4 DSpark requires attention_backend=flex_attention "
-            "to preserve sparse masking and the learned attention sink"
+            "DeepSeek-V4 DSpark requires attention_backend=flex_attention or "
+            "sdpa/eager (dense boolean mask); got "
+            f"{type(attention_mask).__name__}"
         )
 
     def forward(
