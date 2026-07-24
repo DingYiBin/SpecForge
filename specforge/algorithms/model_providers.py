@@ -155,9 +155,7 @@ def _finish_registered_draft(
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
-    # Keep on CPU — FSDP wrapping in backend.py flattens & shards on CPU,
-    # then only the shard (~5 GB) is moved to the accelerator.
-    return draft_model
+    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -342,7 +340,7 @@ def _build_dflash_family_model(
         embed_key=cfg.model.embedding_key,
         lm_head_key=cfg.model.lm_head_key,
         cache_dir=cfg.model.cache_dir,
-        device="cpu",
+        device=_device().type,
         dtype=_torch_dtype(cfg),
         trust_remote_code=cfg.model.trust_remote_code,
     )
@@ -356,7 +354,7 @@ def _build_dflash_family_model(
         "num_anchors": cfg.training.num_anchors,
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
     }
-    model = model_factory(common)
+    model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),

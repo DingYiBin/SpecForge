@@ -26,8 +26,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from specforge.utils import get_local_device
-
 
 @dataclass
 class ParallelConfig:
@@ -142,56 +140,6 @@ class TrainingBackend(abc.ABC):
 
     @abc.abstractmethod
     def load_state_dict(self, state: dict) -> None: ...
-
-
-def _move_fsdp_to_device(
-    model: nn.Module, ignored_modules: tuple[nn.Module, ...]
-) -> None:
-    """Move FSDP FlatParameters and ignored modules to the accelerator device.
-
-    This bypasses ``FSDP._apply`` (which would call
-    ``_sync_params_and_buffers`` via HCCL/NCCL on CPU tensors, causing a
-    backend error) by directly reassigning each FSDP unit's ``_flat_param``
-    storage and calling ``.to()`` on the non-FSDP-managed frozen modules.
-    """
-    target_device = get_local_device()
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-    # 1. Move every FSDP unit's FlatParameter to the target device.
-    for module in model.modules():
-        if isinstance(module, FSDP):
-            flat = getattr(module, "_flat_param", None)
-            if flat is not None and flat.device != target_device:
-                flat.data = flat.data.to(device=target_device)
-
-    # 2. Move ignored (frozen) modules whose parameters still sit on CPU.
-    for ign_mod in ignored_modules:
-        try:
-            ign_mod.to(device=target_device)
-        except Exception:
-            pass
-
-
-def _rebuild_fsdp_views(model: nn.Module) -> None:
-    """Rebuild original-param shard views after an FSDP module is moved to a
-    different device.
-
-    ``FSDP.to(device)`` moves the internal ``FlatParameter`` storage but does
-    *not* update the original ``nn.Parameter`` views (created during FSDP init
-    with ``use_orig_params=True``).  This function forces each FSDP unit to
-    recreate its sharded views so that ``module.parameters()`` returns tensors
-    on the new device.
-    """
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
-    for module in model.modules():
-        if isinstance(module, FSDP):
-            handle = getattr(module, "_handle", None)
-            if handle is not None:
-                try:
-                    handle._use_sharded_views()
-                except Exception:
-                    pass
 
 
 class FSDPTrainingBackend(TrainingBackend):
@@ -325,15 +273,6 @@ class FSDPTrainingBackend(TrainingBackend):
                         limit_all_gathers=True,
                     )
                 model = FSDP(model, **fsdp_kwargs)
-                # Flatten + shard on CPU, then move the shard (~5 GB) to
-                # the accelerator so the full 40 GB model never resides
-                # on the device at once.
-                # NOTE: cannot call model.to(device) because FSDP._apply
-                # invokes _sync_params_and_buffers via HCCL/NCCL, which
-                # does not support CPU tensors.  Move FlatParameters and
-                # ignored modules directly instead.
-                _move_fsdp_to_device(model, ignored_frozen_modules)
-                _rebuild_fsdp_views(model)
                 self._wrapper_kind = "fsdp"
             self.module = model
             self._wrapped = True
