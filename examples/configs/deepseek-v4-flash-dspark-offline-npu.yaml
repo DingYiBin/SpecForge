@@ -2,19 +2,24 @@ model:
   target_model_path: /path/to/DeepSeek-V4-Flash-DSpark
   draft_model_config: configs/deepseek-v4-flash-dspark.json
   draft_checkpoint_path: /path/to/DeepSeek-V4-Flash-DSpark
+  embedding_key: embed.weight     # ← 覆盖默认 model.embed_tokens.weight
+  lm_head_key: head.weight        # ← 覆盖默认 lm_head.weight
   torch_dtype: bfloat16
 
 data:
   hidden_states_path: /path/to/dspark-hidden-states
-  max_length: 4096
+  max_length: 1024
 
 training:
   strategy: dspark
   # Ascend NPU has no flex_attention; sdpa selects the dense block-diagonal
   # attention path in DeepseekV4DSparkAttention (see _dense_attention).
-  attention_backend: sdpa
+  attention_backend: eager
+  # FSDP is the default backend; FULL_SHARD shards params + grads + optimizer
+  # state across ranks (vs the default SHARD_GRAD_OP which keeps full params).
+  fsdp_sharding: FULL_SHARD
   batch_size: 1
-  num_anchors: 512
+  num_anchors: 64
   dspark_ce_loss_alpha: 0.1
   dspark_l1_loss_alpha: 0.9
   dspark_confidence_head_alpha: 1.0

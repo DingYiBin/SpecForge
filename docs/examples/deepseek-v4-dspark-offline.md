@@ -89,3 +89,31 @@ separate SGLang-backed pipeline; run it on an NPU-compatible SGLang service
 (or capture on CUDA and point `data.hidden_states_path` at the exported
 features) before training.
 
+### Reducing memory with FSDP
+
+The trainer always wraps the model with FSDP (`FSDPTrainingBackend`) when
+`nproc_per_node > 1`; the `training.fsdp_sharding` field only selects the
+sharding strategy. The default `SHARD_GRAD_OP` shards optimizer state and
+gradients but keeps full parameters replicated per rank. Switch to
+`FULL_SHARD` to shard parameters as well:
+
+```yaml
+training:
+  fsdp_sharding: FULL_SHARD   # params + grads + optimizer state sharded
+```
+
+or override without editing the YAML:
+
+```bash
+export FSDP_SHARDING=FULL_SHARD
+```
+
+`FULL_SHARD` only shards the **trainable** `mtp.*` parameters. The frozen
+target `embed_tokens`/`lm_head` are deliberately kept replicated (see
+`FSDPTrainingBackend._frozen_target_modules`), so they are unaffected. If
+memory is still tight, lower `data.max_length` (the dominant activation
+lever, since `_dense_attention` cost grows with sequence length) and
+`training.num_anchors` (fewer draft blocks), and keep
+`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` to avoid fragmentation.
+
+
