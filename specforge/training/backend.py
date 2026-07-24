@@ -293,7 +293,11 @@ class FSDPTrainingBackend(TrainingBackend):
                         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
                         limit_all_gathers=True,
                     )
+                if hasattr(torch, "npu") and torch.npu.is_available():
+                    print(f"[dbg] BEFORE FSDP              allocated={torch.npu.memory_allocated()/1024**3:.2f}GB  reserved={torch.npu.memory_reserved()/1024**3:.2f}GB")
                 model = FSDP(model, **fsdp_kwargs)
+                if hasattr(torch, "npu") and torch.npu.is_available():
+                    print(f"[dbg] FSDP done                allocated={torch.npu.memory_allocated()/1024**3:.2f}GB  reserved={torch.npu.memory_reserved()/1024**3:.2f}GB")
                 self._wrapper_kind = "fsdp"
             # Release cached allocator blocks left over from weight loading
             # (e.g. dequantised FP4→bf16 intermediates) so FSDP wrapping

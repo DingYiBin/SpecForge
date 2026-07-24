@@ -155,7 +155,14 @@ def _finish_registered_draft(
     draft_model: Any,
 ):
     _warm_start(cfg, draft_model, draft_config)
-    return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    import torch
+    torch_npu = getattr(torch, "npu", None)
+    if torch_npu is not None and torch_npu.is_available():
+        print(f"[dbg] _finish (before .to(NPU)) allocated={torch_npu.memory_allocated()/1024**3:.2f}GB  reserved={torch_npu.memory_reserved()/1024**3:.2f}GB")
+    result = draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
+    if torch_npu is not None and torch_npu.is_available():
+        print(f"[dbg] _finish (after  .to(NPU)) allocated={torch_npu.memory_allocated()/1024**3:.2f}GB  reserved={torch_npu.memory_reserved()/1024**3:.2f}GB")
+    return result
 
 
 def build_registered_draft(cfg: Config, draft_config: PretrainedConfig):
@@ -355,6 +362,10 @@ def _build_dflash_family_model(
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
     }
     model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
+    import torch
+    torch_npu = getattr(torch, "npu", None)
+    if torch_npu is not None and torch_npu.is_available():
+        print(f"[dbg] _build_dflash (after composite .to(NPU)) allocated={torch_npu.memory_allocated()/1024**3:.2f}GB  reserved={torch_npu.memory_reserved()/1024**3:.2f}GB")
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),
