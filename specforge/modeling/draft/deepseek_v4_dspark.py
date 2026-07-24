@@ -686,7 +686,7 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     """DeepSeek-V4 DSpark module matching the checkpoint's ``mtp.*`` tree."""
 
     config_class = DeepseekV4DSparkConfig
-    _no_split_modules = ["DeepseekV4DSparkMoE"]
+    _no_split_modules = ["DeepseekV4DSparkMoE", "DeepseekV4DSparkExpert"]
     _supports_flex_attn = True
 
     @torch.no_grad()
