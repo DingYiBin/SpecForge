@@ -185,6 +185,52 @@ def _expert_group_key(ckpt_key: str, group_size: int) -> str:
     return ".".join(new_parts)
 
 
+def _ungroup_expert_key(model_key: str) -> str:
+    """Reverse of :func:`_expert_group_key`: flatten grouped keys for HF export.
+
+    Model stores:  ``mtp.0.ffn.expert_groups.0.experts.5.w1.weight``
+    HF expects:    ``mtp.0.ffn.experts.5.w1.weight``
+    """
+    parts = model_key.split(".")
+    try:
+        gidx = parts.index("expert_groups")
+    except ValueError:
+        return model_key
+    # parts: [..., "expert_groups", "<g>", "experts", "<local>", ...]
+    group_idx = int(parts[gidx + 1])
+    local_idx = int(parts[gidx + 3])
+    expert_id = group_idx * 32 + local_idx  # group_size is implicit; see _expert_group_key
+    # Collapse "expert_groups.<g>.experts.<local>" → "experts.<expert_id>"
+    new_parts = parts[:gidx] + ["experts", str(expert_id)] + parts[gidx + 4 :]
+    return ".".join(new_parts)
+
+
+def remap_checkpoint_keys_for_hf_export(
+    state_dict: dict[str, object],
+    group_size: int = 32,
+) -> dict[str, object]:
+    """Convert grouped expert keys back to flat ``experts.<i>`` form.
+
+    Called during HF export so the saved weights match the original
+    DeepSeek-V4 checkpoint layout.
+    """
+    result: dict[str, object] = {}
+    for key, value in state_dict.items():
+        parts = key.split(".")
+        if "expert_groups" in parts:
+            gidx = parts.index("expert_groups")
+            group_idx = int(parts[gidx + 1])
+            local_idx = int(parts[gidx + 3])
+            expert_id = group_idx * group_size + local_idx
+            new_key = ".".join(
+                parts[:gidx] + ["experts", str(expert_id)] + parts[gidx + 4 :]
+            )
+            result[new_key] = value
+        else:
+            result[key] = value
+    return result
+
+
 def build_ckpt_to_model_key_map(
     model_keys: set[str], ckpt_keys: set[str], group_size: int
 ) -> dict[str, str]:
