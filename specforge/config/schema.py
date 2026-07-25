@@ -505,12 +505,11 @@ class TrainingConfig(StrictConfigModel):
     dspark_ce_loss_alpha: float = 0.1
     dspark_l1_loss_alpha: float = 0.9
     dspark_confidence_head_alpha: float = 1.0
-    #: Wrap each draft stage forward with torch.utils.checkpoint to trade
-    #: compute for memory.  The stage activations are NOT saved during
-    #: forward and are recomputed during backward.  Essential for long
-    #: sequences / many anchors when the 3-stage autograd graph exceeds
-    #: device memory.
-    activation_checkpointing: bool = False
+    #: Activation checkpointing granularity: ``"stage"`` wraps the whole
+    #: DSPark stage (attention + MoE), ``"attention"`` wraps only the
+    #: attention module, ``"none"`` disables checkpointing entirely.
+    #: Finer granularity saves less memory but adds less recompute overhead.
+    activation_checkpointing: Literal["stage", "attention", "none"] = "none"
     #: P-EAGLE COD sampling/model knobs.
     num_depths: int = Field(default=8, gt=0)
     down_sample_ratio: float = 0.8

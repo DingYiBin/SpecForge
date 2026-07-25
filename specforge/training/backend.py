@@ -211,14 +211,18 @@ class FSDPTrainingBackend(TrainingBackend):
                 modules.append(module)
         return tuple(modules)
 
+    _AC_MODULES = {
+        "stage": frozenset({"DeepseekV4DSparkStage"}),
+        "attention": frozenset({"DeepseekV4DSparkAttention"}),
+    }
+
     def prepare_model(
         self,
         model: nn.Module,
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
-        activation_checkpointing: bool = False,
-        activation_checkpoint_modules: Optional[frozenset] = None,
+        activation_checkpointing: str = "none",
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
@@ -305,14 +309,15 @@ class FSDPTrainingBackend(TrainingBackend):
                 # forward FSDP all-gathers params, the inner module runs
                 # (activations NOT saved), and during backward the inner
                 # module re-runs (params still gathered).
-                if activation_checkpointing and activation_checkpoint_modules:
+                ac_modules = self._AC_MODULES.get(activation_checkpointing)
+                if ac_modules:
                     import functools
 
                     from torch.utils.checkpoint import checkpoint as _torch_ac
 
                     patched = 0
                     for module in model.modules():
-                        if type(module).__name__ in activation_checkpoint_modules:
+                        if type(module).__name__ in ac_modules:
                             _orig = module.forward
 
                             @functools.wraps(_orig)
@@ -323,11 +328,11 @@ class FSDPTrainingBackend(TrainingBackend):
 
                             module.forward = _ac_forward
                             patched += 1
-                    logger = logging.getLogger(__name__)
-                    logger.info(
-                        "activation checkpointing applied to %d module(s): %s",
-                        patched,
-                        ", ".join(sorted(activation_checkpoint_modules)),
+                    _logger = logging.getLogger(__name__)
+                    _logger.info(
+                        "activation checkpointing=%r applied to %d module(s): %s",
+                        activation_checkpointing, patched,
+                        ", ".join(sorted(ac_modules)),
                     )
                 self._wrapper_kind = "fsdp"
             # Release cached allocator blocks left over from weight loading

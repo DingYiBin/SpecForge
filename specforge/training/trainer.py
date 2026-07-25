@@ -110,7 +110,7 @@ class Trainer:
         sp_ulysses_size: int = 1,
         sp_ring_size: int = 1,
         dataloader_num_workers: int = 0,
-        activation_checkpointing: bool = False,
+        activation_checkpointing: str = "none",
         profiling_options=None,
         fit_context=None,
         on_fit_success: Optional[Callable[[int], None]] = None,
@@ -427,11 +427,6 @@ class Trainer:
             model,
             optimizer_target=model.draft_model,
             activation_checkpointing=activation_checkpointing,
-            activation_checkpoint_modules=(
-                frozenset({"DeepseekV4DSparkStage"})
-                if activation_checkpointing
-                else None
-            ),
         )
         if resume is not None:
             backend.load_state_dict(resume["backend"])
