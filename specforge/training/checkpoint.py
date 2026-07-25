@@ -32,6 +32,19 @@ logger = logging.getLogger(__name__)
 STATE_FILE = "training_state.pt"
 
 
+def _cpu_tensors(obj: Any) -> Any:
+    """Recursively move all tensors in *obj* to CPU so ``torch.save`` works
+    on backends whose tensor serialization is not fully transparent (e.g. NPU).
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu()
+    if isinstance(obj, dict):
+        return {key: _cpu_tensors(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_cpu_tensors(item) for item in obj)
+    return obj
+
+
 class CheckpointManager:
     def __init__(
         self,
@@ -363,7 +376,7 @@ class CheckpointManager:
     @staticmethod
     def _atomic_save(obj: Any, path: str) -> None:
         tmp = path + ".tmp"
-        torch.save(obj, tmp)
+        torch.save(_cpu_tensors(obj), tmp)
         os.replace(tmp, path)
 
     @staticmethod
