@@ -35,9 +35,30 @@ STATE_FILE = "training_state.pt"
 def _cpu_tensors(obj: Any) -> Any:
     """Recursively move all tensors in *obj* to CPU so ``torch.save`` works
     on backends whose tensor serialization is not fully transparent (e.g. NPU).
+
+    The hot path is the PyTorch optimizer state dict
+    ``{"state": {fqn: {"exp_avg": t, "exp_avg_sq": t, ...}}, "param_groups": [...]}``
+    which contains thousands of per-parameter entries.  We special-case it to
+    avoid the Python overhead of recursively deep-copying the dict scaffolding.
     """
     if isinstance(obj, torch.Tensor):
         return obj.cpu()
+
+    # Optimizer state dict fast path — iterate ``state`` entries directly,
+    # share the tensor-free ``param_groups`` list.
+    if isinstance(obj, dict) and "state" in obj and "param_groups" in obj:
+        _cpu = torch.Tensor.cpu
+        cpu_state: dict = {}
+        for fqn, entry in obj["state"].items():
+            if isinstance(entry, dict):
+                cpu_state[fqn] = {
+                    k: _cpu(v) if isinstance(v, torch.Tensor) else v
+                    for k, v in entry.items()
+                }
+            else:
+                cpu_state[fqn] = _cpu(entry) if isinstance(entry, torch.Tensor) else entry
+        return {"state": cpu_state, "param_groups": obj["param_groups"]}
+
     if isinstance(obj, dict):
         return {key: _cpu_tensors(value) for key, value in obj.items()}
     if isinstance(obj, (list, tuple)):
