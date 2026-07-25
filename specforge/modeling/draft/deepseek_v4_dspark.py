@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -187,19 +189,22 @@ def build_ckpt_to_model_key_map(
     model_keys: set[str], ckpt_keys: set[str], group_size: int
 ) -> dict[str, str]:
     """Build ``{model_key: ckpt_key}`` mapping handling expert grouping."""
+    # Pre-build reverse index: grouped checkpoint key → original checkpoint key
+    ckpt_by_grouped: dict[str, str] = {}
+    for ck in ckpt_keys:
+        grouped = _expert_group_key(ck, group_size)
+        if grouped != ck:
+            ckpt_by_grouped[grouped] = ck
+
     mapping = {}
     for mkey in model_keys:
-        # Try direct match first
         if mkey in ckpt_keys:
             mapping[mkey] = mkey
             continue
-        # Try remapping: convert checkpoint expert key to grouped model key
-        # ckpt: ...experts.5.w1  →  model: ...expert_groups.0.experts.5.w1
-        for ck in ckpt_keys:
-            grouped_ck = _expert_group_key(ck, group_size)
-            if grouped_ck == mkey:
-                mapping[mkey] = ck
-                break
+        # O(1) lookup via pre-built index
+        ck = ckpt_by_grouped.get(mkey)
+        if ck is not None:
+            mapping[mkey] = ck
     return mapping
 
 
@@ -242,6 +247,13 @@ def load_deepseek_v4_dspark_hf_weights(
         ck_key = key_map[mkey]
         shard_to_keys.setdefault(weight_map[ck_key], []).append((mkey, ck_key))
 
+    logger = logging.getLogger(__name__)
+    total_weights = len(model_keys)
+    logger.info(
+        "Loading %d DeepSeek-V4 DSpark weights from %d shard(s) ...",
+        total_weights, len(shard_to_keys),
+    )
+    t_start = time.monotonic()
     loaded = 0
 
     def load_scale(ck_scale_key: str) -> torch.Tensor:
@@ -289,6 +301,11 @@ def load_deepseek_v4_dspark_hf_weights(
                     )
                 destination[mkey].data.copy_(value)
                 loaded += 1
+    elapsed = time.monotonic() - t_start
+    logger.info(
+        "Loaded %d weights in %.1fs (%.0f weights/s)",
+        loaded, elapsed, loaded / elapsed if elapsed > 0 else float("inf"),
+    )
     return loaded, ()
 
 

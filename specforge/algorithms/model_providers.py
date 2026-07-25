@@ -70,6 +70,15 @@ def _warm_start(
 ) -> None:
     if not cfg.model.draft_checkpoint_path:
         return
+    import torch.distributed as dist
+
+    # FSDP FULL_SHARD syncs module states from rank 0 after wrapping.  Only
+    # rank 0 needs to load the real checkpoint; other ranks keep the empty
+    # (no_init_weights) placeholders and receive the correct parameters
+    # through FSDP's broadcast during prepare_model().  This avoids 8× disk
+    # I/O and 8× FP4/FP8 CPU dequantization of the ~12 GB checkpoint.
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
     from specforge.training.model_loading import warm_start_draft_model
 
     warm_start_draft_model(
