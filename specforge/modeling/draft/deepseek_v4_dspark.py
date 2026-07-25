@@ -518,17 +518,7 @@ class DeepseekV4DSparkAttention(nn.Module):
         sink_scale = torch.sigmoid(
             lse - self.attn_sink.float().view(1, -1, 1)
         ).to(output.dtype)
-        result = output * sink_scale.unsqueeze(-1)
-
-        # Log peak memory during attention
-        npu = getattr(torch, "npu", None)
-        if npu is not None and npu.is_available():
-            alloc = npu.memory_allocated() / 1024**3
-            reserved = npu.memory_reserved() / 1024**3
-            print(f"[mem] dense_attn_end    (Q={Q}, chunk={chunk}): "
-                  f"allocated={alloc:.2f}GB  reserved={reserved:.2f}GB", flush=True)
-
-        return result
+        return output * sink_scale.unsqueeze(-1)
 
     def _attention(
         self,

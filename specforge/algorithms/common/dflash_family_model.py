@@ -988,18 +988,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         }
         return loss, metrics
 
-    @staticmethod
-    def _mem(tag: str) -> None:
-        """Print NPU memory usage with *tag* so hotspots are visible in logs."""
-        import torch
-
-        npu = getattr(torch, "npu", None)
-        if npu is None or not npu.is_available():
-            return
-        alloc = npu.memory_allocated() / 1024**3
-        reserved = npu.memory_reserved() / 1024**3
-        print(f"[mem] {tag}: allocated={alloc:.2f}GB  reserved={reserved:.2f}GB", flush=True)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1012,17 +1000,14 @@ class OnlineDSparkModel(OnlineDFlashModel):
             raise ValueError(
                 "flex_attention is not available on this device; use sdpa/eager."
             )
-        self._mem("forward_start")
         bsz = input_ids.shape[0]
         anchor_positions, block_keep_mask, output_hidden = self._forward_draft_blocks(
             input_ids=input_ids,
             hidden_states=hidden_states,
             loss_mask=loss_mask,
         )
-        self._mem("after_draft_blocks  (num_anchors={})".format(anchor_positions.size(1)))
 
         logits = self.lm_head(output_hidden)
-        self._mem("after_lm_head       (logits={})".format(tuple(logits.shape)))
         num_blocks = anchor_positions.size(1)
         output_hidden_4d = output_hidden.reshape(bsz, num_blocks, self.block_size, -1)
         (
@@ -1054,9 +1039,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             target_last_hidden_states,
             safe_label_indices,
         )
-        self._mem("before_loss         (aligned_target shape={})".format(
-            tuple(aligned_target_logits.shape) if aligned_target_logits is not None else None,
-        ))
         loss, metrics = self._compute_dspark_loss(
             draft_logits=draft_logits,
             target_ids=target_ids,
@@ -1064,7 +1046,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             confidence_pred=confidence_pred,
             aligned_target_logits=aligned_target_logits,
         )
-        self._mem("after_loss")
         flat_logits = draft_logits.reshape(-1, draft_logits.size(-1))
         flat_targets = target_ids.reshape(-1)
         binary_eval_mask = eval_mask.reshape(-1)
@@ -1074,5 +1055,4 @@ class OnlineDSparkModel(OnlineDFlashModel):
             accuracy_denom = binary_eval_mask.to(torch.float32).sum()
             accuracy = correct.sum().float() / (accuracy_denom + 1e-6)
             metrics["accuracy_denom"] = accuracy_denom.detach()
-        self._mem("forward_end")
         return loss, accuracy, metrics
