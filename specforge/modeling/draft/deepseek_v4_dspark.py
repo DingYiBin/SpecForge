@@ -156,6 +156,51 @@ def _dequantize_fp8(
     )
 
 
+def _expert_group_key(ckpt_key: str, group_size: int) -> str:
+    """Map a checkpoint ``...experts.<i>...`` key to the grouped model path.
+
+    Checkpoint stores:  ``mtp.0.ffn.experts.5.w1.weight``
+    Model uses:         ``mtp.0.ffn.expert_groups.0.experts.5.w1.weight``
+                        (expert 5 is in group 0 = experts 0-31 when group_size=32)
+    """
+    parts = ckpt_key.split(".")
+    try:
+        idx = parts.index("experts")
+    except ValueError:
+        return ckpt_key
+    # parts[idx] = "experts", parts[idx+1] = expert index
+    expert_id = int(parts[idx + 1])
+    group_idx = expert_id // group_size
+    local_idx = expert_id % group_size
+    # Insert "expert_groups.<g>" before "experts"
+    new_parts = (
+        parts[:idx]
+        + ["expert_groups", str(group_idx), "experts", str(local_idx)]
+        + parts[idx + 2 :]
+    )
+    return ".".join(new_parts)
+
+
+def build_ckpt_to_model_key_map(
+    model_keys: set[str], ckpt_keys: set[str], group_size: int
+) -> dict[str, str]:
+    """Build ``{model_key: ckpt_key}`` mapping handling expert grouping."""
+    mapping = {}
+    for mkey in model_keys:
+        # Try direct match first
+        if mkey in ckpt_keys:
+            mapping[mkey] = mkey
+            continue
+        # Try remapping: convert checkpoint expert key to grouped model key
+        # ckpt: ...experts.5.w1  →  model: ...expert_groups.0.experts.5.w1
+        for ck in ckpt_keys:
+            grouped_ck = _expert_group_key(ck, group_size)
+            if grouped_ck == mkey:
+                mapping[mkey] = ck
+                break
+    return mapping
+
+
 def load_deepseek_v4_dspark_hf_weights(
     model: nn.Module,
     source: str,
@@ -181,35 +226,41 @@ def load_deepseek_v4_dspark_hf_weights(
         weight_map = json.load(stream).get("weight_map", {})
 
     destination = model.state_dict(keep_vars=True)
-    required = {key for key in destination if key.startswith("mtp.")}
-    missing = sorted(required - weight_map.keys())
+    model_keys = {key for key in destination if key.startswith("mtp.")}
+    # Build mapping from model keys to checkpoint keys
+    ckpt_keys = set(weight_map.keys())
+    key_map = build_ckpt_to_model_key_map(model_keys, ckpt_keys, 32)
+    missing = sorted(model_keys - key_map.keys())
     if missing:
         return 0, tuple(missing)
 
-    shard_to_keys: dict[str, list[str]] = {}
-    for key in sorted(required):
-        shard_to_keys.setdefault(weight_map[key], []).append(key)
+    shard_to_keys: dict[str, list[tuple[str, str]]] = {}
+    for mkey in sorted(model_keys):
+        ck_key = key_map[mkey]
+        shard_to_keys.setdefault(weight_map[ck_key], []).append((mkey, ck_key))
 
     loaded = 0
 
-    def load_scale(scale_key: str) -> torch.Tensor:
-        shard = weight_map.get(scale_key)
+    def load_scale(ck_scale_key: str) -> torch.Tensor:
+        shard = weight_map.get(ck_scale_key)
         if shard is None:
-            raise KeyError(scale_key)
+            raise KeyError(ck_scale_key)
         with safe_open(
             os.path.join(local_source, shard), framework="pt", device="cpu"
         ) as handle:
-            return handle.get_tensor(scale_key)
+            return handle.get_tensor(ck_scale_key)
 
-    for shard, keys in shard_to_keys.items():
+    for shard, pairs in shard_to_keys.items():
         with safe_open(
             os.path.join(local_source, shard), framework="pt", device="cpu"
         ) as handle:
             shard_names = set(handle.keys())
-            for key in keys:
-                value = handle.get_tensor(key)
+            for mkey, ck_key in pairs:
+                value = handle.get_tensor(ck_key)
                 scale_key = (
-                    key[: -len(".weight")] + ".scale" if key.endswith(".weight") else ""
+                    ck_key[: -len(".weight")] + ".scale"
+                    if ck_key.endswith(".weight")
+                    else ""
                 )
                 if value.dtype == torch.int8 and scale_key:
                     scale = (
@@ -217,22 +268,23 @@ def load_deepseek_v4_dspark_hf_weights(
                         if scale_key in shard_names
                         else load_scale(scale_key)
                     )
-                    value = _dequantize_fp4(value, scale, destination[key].dtype)
+                    value = _dequantize_fp4(value, scale, destination[mkey].dtype)
                 elif value.dtype == torch.float8_e4m3fn and scale_key:
                     scale = (
                         handle.get_tensor(scale_key)
                         if scale_key in shard_names
                         else load_scale(scale_key)
                     )
-                    value = _dequantize_fp8(value, scale, destination[key].dtype)
+                    value = _dequantize_fp8(value, scale, destination[mkey].dtype)
                 else:
-                    value = value.to(destination[key].dtype)
-                if value.shape != destination[key].shape:
+                    value = value.to(destination[mkey].dtype)
+                if value.shape != destination[mkey].shape:
                     raise ValueError(
-                        f"DeepSeek-V4 DSpark tensor shape mismatch for {key}: "
-                        f"checkpoint={tuple(value.shape)}, model={tuple(destination[key].shape)}"
+                        f"DeepSeek-V4 DSpark tensor shape mismatch for {mkey}: "
+                        f"checkpoint={tuple(value.shape)}, "
+                        f"model={tuple(destination[mkey].shape)}"
                     )
-                destination[key].data.copy_(value)
+                destination[mkey].data.copy_(value)
                 loaded += 1
     return loaded, ()
 
@@ -514,12 +566,68 @@ class DeepseekV4DSparkRouter(nn.Module):
         return indices, weights * self.routed_scaling_factor
 
 
+class DeepseekV4DSparkExpertGroup(nn.Module):
+    """Group of consecutive experts wrapped as one FSDP unit.
+
+    ``group_size=32`` gives ~800M params / 1.6 GB per group, so FULL_SHARD
+    init (which allocates a full flat buffer + scatter buffer = 2× unit size)
+    stays within device memory (~3.2 GB temporary vs ~24 GB for all 256).  The
+    forward iterates experts in ``active_experts`` order just like the flat
+    MoE, so the routing behaviour is identical.
+    """
+
+    def __init__(self, config: DeepseekV4Config, group_size: int, global_offset: int):
+        super().__init__()
+        self.global_offset = global_offset
+        self.experts = nn.ModuleList(
+            [DeepseekV4DSparkExpert(config) for _ in range(group_size)]
+        )
+
+    @property
+    def group_size(self) -> int:
+        return len(self.experts)
+
+    def forward(
+        self,
+        flat: torch.Tensor,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+        routed: torch.Tensor,
+    ) -> torch.Tensor:
+        lo = self.global_offset
+        for local_id, expert in enumerate(self.experts):
+            expert_id = lo + local_id
+            token_slot, route_slot = torch.where(indices == expert_id)
+            if token_slot.numel() > 0:
+                out = expert(flat[token_slot])
+                out = out * weights[token_slot, route_slot].unsqueeze(-1)
+                routed.index_add_(0, token_slot, out.to(routed.dtype))
+        return routed
+
+
 class DeepseekV4DSparkMoE(nn.Module):
+    """MoE with experts partitioned into FSDP-friendly groups.
+
+    Checkpoint keys under ``experts.`` are remapped to
+    ``expert_groups.<g>.experts.<e>`` during weight loading — see
+    :func:`_expert_group_key` and :func:`load_deepseek_v4_dspark_hf_weights`.
+    """
+
+    _GROUP_SIZE = 32  # 256 / 32 = 8 groups per MoE
+
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
         self.gate = DeepseekV4DSparkRouter(config)
-        self.experts = nn.ModuleList(
-            [DeepseekV4DSparkExpert(config) for _ in range(config.n_routed_experts)]
+        n_routed = int(config.n_routed_experts)
+        assert n_routed % self._GROUP_SIZE == 0, (
+            f"n_routed_experts ({n_routed}) must be divisible by "
+            f"group_size ({self._GROUP_SIZE})"
+        )
+        self.expert_groups = nn.ModuleList(
+            [
+                DeepseekV4DSparkExpertGroup(config, self._GROUP_SIZE, s)
+                for s in range(0, n_routed, self._GROUP_SIZE)
+            ]
         )
         self.shared_experts = DeepseekV4DSparkExpert(config)
 
@@ -528,15 +636,11 @@ class DeepseekV4DSparkMoE(nn.Module):
         flat = hidden_states.reshape(-1, shape[-1])
         indices, weights = self.gate(flat)
         routed = torch.zeros_like(flat)
-        with torch.no_grad():
-            active_experts = torch.unique(indices).tolist()
-        for expert_id in active_experts:
-            token_slot, route_slot = torch.where(indices == expert_id)
-            expert_output = self.experts[expert_id](flat[token_slot])
-            expert_output = expert_output * weights[token_slot, route_slot].unsqueeze(
-                -1
-            )
-            routed.index_add_(0, token_slot, expert_output.to(routed.dtype))
+        # Each ExpertGroup is an FSDP unit — iteration triggers per-group
+        # all-gather.  Groups with no routed tokens touch no parameters
+        # internally, but FSDP gathers the flat-param on entry regardless.
+        for group in self.expert_groups:
+            routed = group(flat, indices, weights, routed)
         return (routed + self.shared_experts(flat)).view(shape)
 
 
@@ -686,7 +790,7 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
     """DeepSeek-V4 DSpark module matching the checkpoint's ``mtp.*`` tree."""
 
     config_class = DeepseekV4DSparkConfig
-    _no_split_modules = ["DeepseekV4DSparkMoE", "DeepseekV4DSparkExpert"]
+    _no_split_modules = ["DeepseekV4DSparkMoE", "DeepseekV4DSparkExpertGroup"]
     _supports_flex_attn = True
 
     @torch.no_grad()
