@@ -29,6 +29,9 @@ training:
   dspark_ce_loss_alpha: 0.1
   dspark_l1_loss_alpha: 0.9
   dspark_confidence_head_alpha: 1.0
+  # 开启 activation checkpointing：前向不保存中间激活，反向时重新计算。
+  # 用额外 30% 计算时间换取大幅显存下降，长序列/多 anchor 时建议开启。
+  activation_checkpointing: false
   save_interval: 1000
   log_interval: 50
   dist_timeout: 30

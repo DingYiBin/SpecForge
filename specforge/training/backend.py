@@ -217,6 +217,8 @@ class FSDPTrainingBackend(TrainingBackend):
         *,
         wrap: bool = True,
         optimizer_target: Optional[nn.Module] = None,
+        activation_checkpointing: bool = False,
+        activation_checkpoint_modules: Optional[frozenset] = None,
     ) -> nn.Module:
         """Register and wrap the trainable module unless ``wrap=False``.
 
@@ -298,6 +300,35 @@ class FSDPTrainingBackend(TrainingBackend):
                 model = FSDP(model, **fsdp_kwargs)
                 if hasattr(torch, "npu") and torch.npu.is_available():
                     print(f"[dbg] FSDP done                allocated={torch.npu.memory_allocated()/1024**3:.2f}GB  reserved={torch.npu.memory_reserved()/1024**3:.2f}GB")
+                # Apply activation checkpointing AFTER FSDP wrapping so the
+                # checkpoint wrapper sits *inside* the FSDP unit.  During
+                # forward FSDP all-gathers params, the inner module runs
+                # (activations NOT saved), and during backward the inner
+                # module re-runs (params still gathered).
+                if activation_checkpointing and activation_checkpoint_modules:
+                    import functools
+
+                    from torch.utils.checkpoint import checkpoint as _torch_ac
+
+                    patched = 0
+                    for module in model.modules():
+                        if type(module).__name__ in activation_checkpoint_modules:
+                            _orig = module.forward
+
+                            @functools.wraps(_orig)
+                            def _ac_forward(*args, _orig=_orig, **kwargs):
+                                return _torch_ac(
+                                    _orig, *args, use_reentrant=False, **kwargs
+                                )
+
+                            module.forward = _ac_forward
+                            patched += 1
+                    logger = logging.getLogger(__name__)
+                    logger.info(
+                        "activation checkpointing applied to %d module(s): %s",
+                        patched,
+                        ", ".join(sorted(activation_checkpoint_modules)),
+                    )
                 self._wrapper_kind = "fsdp"
             # Release cached allocator blocks left over from weight loading
             # (e.g. dequantised FP4→bf16 intermediates) so FSDP wrapping
