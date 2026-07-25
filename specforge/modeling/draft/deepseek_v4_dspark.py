@@ -69,6 +69,7 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
         dflash_config: Optional[dict] = None,
         draft_vocab_size: Optional[int] = None,
         moe_train_group_size: int = 32,
+        attention_chunk_size: int = 256,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -79,6 +80,7 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
             else int(self.vocab_size)
         )
         self.moe_train_group_size = int(moe_train_group_size)
+        self.attention_chunk_size = int(attention_chunk_size)
 
 
 _FP4_E2M1 = (
@@ -366,6 +368,7 @@ class DeepseekV4DSparkAttention(nn.Module):
         self.head_dim = int(config.head_dim)
         self.scaling = self.head_dim**-0.5
         self.block_size = int(_method_config(config).get("block_size", 0))
+        self.attention_chunk_size = int(getattr(config, "attention_chunk_size", 256))
 
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = DeepseekV4RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
@@ -438,8 +441,6 @@ class DeepseekV4DSparkAttention(nn.Module):
         query: torch.Tensor,
         kv: torch.Tensor,
         attention_mask: torch.Tensor,
-        *,
-        chunk: int = 256,
     ) -> torch.Tensor:
         """Manual dense-mask attention for devices without flex_attention.
 
@@ -460,6 +461,7 @@ class DeepseekV4DSparkAttention(nn.Module):
         ``lse = log(Z_ctx + Z_draft)``.  Shared-KV MLA uses ``kv`` as both keys
         and values, broadcast from one head to all query heads.
         """
+        chunk = self.attention_chunk_size
         mask = attention_mask.bool()
         B, H, Q, d = query.shape
         KV = kv.shape[2]

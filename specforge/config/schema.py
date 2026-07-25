@@ -51,6 +51,10 @@ class ModelConfig(StrictConfigModel):
     #: 256 experts / 32 = 8 groups; smaller values reduce per-unit memory at
     #: the cost of more all-gather communication (default: 32).
     moe_train_group_size: Optional[int] = Field(default=None, gt=0)
+    #: Chunk size for the chunked dense attention path on devices without
+    #: flex_attention (e.g. NPU).  Smaller values reduce peak memory at the
+    #: cost of more kernel launches (default: 256).
+    attention_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: Online capture always runs on an external SGLang server; the in-process
     #: HF/custom target backends were removed with the server-only cutover, so
     #: configs naming them fail at load instead of being silently ignored.

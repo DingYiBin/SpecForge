@@ -8,6 +8,9 @@ model:
   # （可选）每个 FSDP unit 包含的 expert 数量，默认 32。
   # 256 / 32 = 8 组。值越小显存占用越低，但通信次数越多。
   moe_train_group_size: 16
+  # （可选）dense attention 分块大小，默认 256。长序列 / 多 anchor 导致
+  # attention OOM 时调小此值（如 64 或 32）。
+  attention_chunk_size: 64
 
 data:
   hidden_states_path: /path/to/dspark-hidden-states
