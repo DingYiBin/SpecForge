@@ -116,4 +116,36 @@ lever, since `_dense_attention` cost grows with sequence length) and
 `training.num_anchors` (fewer draft blocks), and keep
 `PYTORCH_NPU_ALLOC_CONF=expandable_segments:True` to avoid fragmentation.
 
+## Export checkpoint to HuggingFace format
 
+The training checkpoint stores weights with an ExpertGroup layout
+(``expert_groups.<g>.experts.<i>.*``). The export command remaps keys
+back to the original flat ``experts.<idx>.*`` form so the output loads
+with upstream HuggingFace tooling.
+
+```bash
+specforge export --to hf \
+  --checkpoint outputs/deepseek-v4-dspark-npu-offline-step1000 \
+  --draft-config configs/deepseek-v4-flash-dspark.json \
+  --output-dir ./exported-dspark-hf
+```
+
+The checkpoint path accepts:
+- A ``{run_id}-step{N}`` directory (``outputs/deepseek-v4-dspark-npu-offline-step1000``)
+- An output directory containing a ``{run_id}-latest`` symlink (``outputs/``)
+- A ``training_state.pt`` file directly
+- A ``file://`` URI of any of the above
+
+The resulting ``--output-dir`` is a self-contained HuggingFace directory
+(config.json + safetensors) that reloads via
+``AutoDraftModel.from_pretrained(./exported-dspark-hf)``. If the target
+embedding is frozen (not present in the checkpoint), pass the target
+model path so the export ships the real embedding:
+
+```bash
+specforge export --to hf \
+  --checkpoint outputs/deepseek-v4-dspark-npu-offline-step1000 \
+  --draft-config configs/deepseek-v4-flash-dspark.json \
+  --output-dir ./exported-dspark-hf \
+  --embedding-source /path/to/DeepSeek-V4-Flash-DSpark
+```
