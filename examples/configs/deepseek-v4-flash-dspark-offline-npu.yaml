@@ -5,6 +5,9 @@ model:
   embedding_key: embed.weight     # ← 覆盖默认 model.embed_tokens.weight
   lm_head_key: head.weight        # ← 覆盖默认 lm_head.weight
   torch_dtype: bfloat16
+  # （可选）每个 FSDP unit 包含的 expert 数量，默认 32。
+  # 256 / 32 = 8 组。值越小显存占用越低，但通信次数越多。
+  moe_train_group_size: 16
 
 data:
   hidden_states_path: /path/to/dspark-hidden-states

@@ -66,6 +66,7 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
         *,
         dflash_config: Optional[dict] = None,
         draft_vocab_size: Optional[int] = None,
+        moe_train_group_size: int = 32,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -75,6 +76,7 @@ class DeepseekV4DSparkConfig(DeepseekV4Config):
             if draft_vocab_size is not None
             else int(self.vocab_size)
         )
+        self.moe_train_group_size = int(moe_train_group_size)
 
 
 _FP4_E2M1 = (
@@ -206,6 +208,7 @@ def load_deepseek_v4_dspark_hf_weights(
     source: str,
     *,
     cache_dir: Optional[str] = None,
+    group_size: int = 32,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream only ``mtp.*`` tensors from a full DSv4 HF checkpoint."""
 
@@ -229,7 +232,7 @@ def load_deepseek_v4_dspark_hf_weights(
     model_keys = {key for key in destination if key.startswith("mtp.")}
     # Build mapping from model keys to checkpoint keys
     ckpt_keys = set(weight_map.keys())
-    key_map = build_ckpt_to_model_key_map(model_keys, ckpt_keys, 32)
+    key_map = build_ckpt_to_model_key_map(model_keys, ckpt_keys, group_size)
     missing = sorted(model_keys - key_map.keys())
     if missing:
         return 0, tuple(missing)
@@ -608,25 +611,29 @@ class DeepseekV4DSparkExpertGroup(nn.Module):
 class DeepseekV4DSparkMoE(nn.Module):
     """MoE with experts partitioned into FSDP-friendly groups.
 
+    ``config.moe_train_group_size`` (default 32) controls the number of
+    experts per group. 256 / 32 = 8 FSDP units.  Smaller values reduce
+    per-unit temporary memory at the cost of more all-gather communication.
+
     Checkpoint keys under ``experts.`` are remapped to
     ``expert_groups.<g>.experts.<e>`` during weight loading — see
     :func:`_expert_group_key` and :func:`load_deepseek_v4_dspark_hf_weights`.
     """
 
-    _GROUP_SIZE = 32  # 256 / 32 = 8 groups per MoE
-
     def __init__(self, config: DeepseekV4Config):
         super().__init__()
         self.gate = DeepseekV4DSparkRouter(config)
         n_routed = int(config.n_routed_experts)
-        assert n_routed % self._GROUP_SIZE == 0, (
+        group_size = int(getattr(config, "moe_train_group_size", 32))
+        assert n_routed % group_size == 0, (
             f"n_routed_experts ({n_routed}) must be divisible by "
-            f"group_size ({self._GROUP_SIZE})"
+            f"moe_train_group_size ({group_size})"
         )
+        self.group_size = group_size
         self.expert_groups = nn.ModuleList(
             [
-                DeepseekV4DSparkExpertGroup(config, self._GROUP_SIZE, s)
-                for s in range(0, n_routed, self._GROUP_SIZE)
+                DeepseekV4DSparkExpertGroup(config, group_size, s)
+                for s in range(0, n_routed, group_size)
             ]
         )
         self.shared_experts = DeepseekV4DSparkExpert(config)
