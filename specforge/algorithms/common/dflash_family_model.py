@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from specforge.modeling.draft.dflash import DFlashDraftModel
 
@@ -772,6 +773,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
+        recompute_loss: bool = True,
     ):
         super().__init__(
             draft_model=draft_model,
@@ -795,6 +797,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         self.dspark_ce_loss_alpha = float(dspark_ce_loss_alpha)
         self.dspark_l1_loss_alpha = float(dspark_l1_loss_alpha)
         self.dspark_confidence_head_alpha = float(dspark_confidence_head_alpha)
+        self.recompute_loss = bool(recompute_loss)
 
     def _build_anchor_candidate_mask(
         self,
@@ -923,88 +926,115 @@ class OnlineDSparkModel(OnlineDFlashModel):
         _dbg_mem("_aligned_target_logits after gather")
         return self.lm_head(aligned_target_hidden)
 
+    def _pos_loss(
+        self,
+        dl_p: torch.Tensor,        # (bsz, num_anchors, vocab)
+        tl_p: Optional[torch.Tensor],   # (bsz, num_anchors, vocab) or None
+        tids_p: torch.Tensor,     # (bsz, num_anchors) long
+        cconf_p: Optional[torch.Tensor],  # (bsz, num_anchors) or None
+    ):
+        """Per-position CE + L1 + confidence BCE. Designed to run under
+        ``torch.utils.checkpoint`` so the (bsz, num_anchors, vocab) fp32
+        softmaxes / CE upcast are recomputed in backward instead of being saved.
+        """
+        ce = F.cross_entropy(dl_p, tids_p, reduction="none")  # (bsz, num_anchors)
+        if tl_p is not None:
+            l1 = (
+                torch.softmax(dl_p.float(), dim=-1)
+                - torch.softmax(tl_p.float(), dim=-1)
+            ).abs().sum(dim=-1)  # (bsz, num_anchors)
+        else:
+            l1 = ce.new_zeros(ce.shape)
+        if cconf_p is not None:
+            accept = (1.0 - 0.5 * l1).clamp(0.0, 1.0).detach()
+            conf_err = F.binary_cross_entropy_with_logits(
+                cconf_p.float(), accept, reduction="none"
+            )  # (bsz, num_anchors)
+        else:
+            conf_err = ce.new_zeros(ce.shape)
+        return ce, l1, conf_err
+
     def _compute_dspark_loss(
         self,
         *,
-        draft_logits: torch.Tensor,
-        target_ids: torch.Tensor,
-        eval_mask: torch.Tensor,
-        confidence_pred: Optional[torch.Tensor],
-        aligned_target_logits: Optional[torch.Tensor],
+        draft_logits: torch.Tensor,            # (bsz, num_anchors, block_size, vocab)
+        target_ids: torch.Tensor,             # (bsz, num_anchors, block_size)
+        eval_mask: torch.Tensor,              # (bsz, num_anchors, block_size)
+        confidence_pred: Optional[torch.Tensor],   # (bsz, num_anchors, block_size)
+        aligned_target_logits: Optional[torch.Tensor],  # (bsz, num_anchors, block_size, vocab)
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        vocab_size = draft_logits.size(-1)
         loss_weight_mask = self._dspark_loss_weight_mask(eval_mask)
-        flat_logits = draft_logits.reshape(-1, vocab_size)
-        flat_targets = target_ids.reshape(-1)
-        flat_weights = loss_weight_mask.reshape(-1)
+        ce_loss_den = loss_weight_mask.sum()
+        block_size = self.block_size
 
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        ce_loss_den = flat_weights.sum()
-        ce_loss = (loss_per_token * flat_weights).sum() / (ce_loss_den + 1e-6)
-        loss_per_position = loss_per_token.reshape_as(target_ids)
+        ce_loss = loss_weight_mask.new_zeros(())
+        l1_loss = loss_weight_mask.new_zeros(())
+        confidence_loss = loss_weight_mask.new_zeros(())
+        confidence_abs_error = loss_weight_mask.new_zeros(())
+        position_metrics: Dict[str, torch.Tensor] = {}
 
-        position_metrics = {}
-        for position in range(self.block_size):
-            position_weights = loss_weight_mask[..., position]
-            position_loss = (
-                loss_per_position[..., position] * position_weights
-            ).sum() / (position_weights.sum() + 1e-6)
-            position_metrics[f"mtp_{position + 1}_loss"] = position_loss.detach()
-
-        l1_loss = ce_loss.new_zeros(())
-        accept_rate_3d = None
         needs_target_distribution = (
             self.dspark_l1_loss_alpha > 0 or confidence_pred is not None
         )
-        if aligned_target_logits is not None and needs_target_distribution:
-            _dbg_mem("_compute_dspark_loss before softmax")
-            # Chunk over the anchor axis to bound peak memory: two full fp32
-            # softmaxes + diff + abs is ~5 GiB at 512x5x129280 and OOM'd here.
-            # All ops are out-of-place on purpose — in-place sub_/abs_ on the
-            # softmax output would corrupt softmax backward (it saves the
-            # output for gradient), breaking autograd.
-            l1_dist_parts = []
-            chunk = 64
-            n = draft_logits.size(1)
-            for start in range(0, n, chunk):
-                end = min(start + chunk, n)
-                dp = torch.softmax(draft_logits[:, start:end].float(), dim=-1)
-                tp = torch.softmax(aligned_target_logits[:, start:end].float(), dim=-1)
-                l1_dist_parts.append((dp - tp).abs().sum(dim=-1))
-                del dp, tp
-            l1_dist = torch.cat(l1_dist_parts, dim=1)
-            _dbg_mem("_compute_dspark_loss after l1_dist")
-            accept_rate_3d = 1.0 - 0.5 * l1_dist
-            accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
-            if self.dspark_l1_loss_alpha > 0:
-                l1_loss = (l1_dist * loss_weight_mask).sum() / (ce_loss_den + 1e-6)
-        elif self.dspark_l1_loss_alpha > 0 or self.dspark_confidence_head_alpha > 0:
+        if aligned_target_logits is None and needs_target_distribution:
             raise ValueError(
                 "DSpark L1/confidence loss requires target_last_hidden_states. "
                 "Use the disaggregated DSpark server-capture path so the "
                 "consumer receives target_last_hidden_states."
             )
 
-        confidence_loss = ce_loss.new_zeros(())
-        confidence_abs_error = ce_loss.new_zeros(())
-        if confidence_pred is not None:
-            if accept_rate_3d is None:
-                raise ValueError(
-                    "DSpark confidence head requires aligned target logits."
+        _dbg_mem("_compute_dspark_loss per-position loop enter")
+        for position in range(block_size):
+            dl_p = draft_logits[:, :, position, :]
+            # Only compute the target distribution when it's actually needed
+            # (l1 or confidence); otherwise skip softmax entirely.
+            tl_p = (
+                None if aligned_target_logits is None or not needs_target_distribution
+                else aligned_target_logits[:, :, position, :]
+            )
+            tids_p = target_ids[:, :, position]
+            cconf_p = (
+                None if confidence_pred is None else confidence_pred[..., position]
+            )
+            wmask_p = loss_weight_mask[..., position]
+
+            # Checkpoint per draft position: the fp32 softmaxes and CE upcast
+            # (~1 GiB each at 512x129280) are recomputed in backward instead of
+            # being held for the whole backward pass. Checkpoint inputs are
+            # views into draft_logits / aligned_target_logits, so saving them
+            # costs nothing extra. Gated by self.recompute_loss so the
+            # recomputation can be disabled for a compute-vs-memory tradeoff.
+            if self.recompute_loss:
+                ce_p, l1_p, conf_err_p = _grad_checkpoint(
+                    self._pos_loss,
+                    dl_p, tl_p, tids_p, cconf_p,
+                    use_reentrant=False,
                 )
-            confidence_errors = F.binary_cross_entropy_with_logits(
-                confidence_pred.float(),
-                accept_rate_3d.detach(),
-                reduction="none",
-            )
-            confidence_loss = (confidence_errors * loss_weight_mask).sum() / (
-                ce_loss_den + 1e-6
-            )
-            with torch.no_grad():
-                confidence_abs_error = (
-                    (confidence_pred.float().sigmoid() - accept_rate_3d).abs()
-                    * loss_weight_mask
-                ).sum() / (ce_loss_den + 1e-6)
+            else:
+                ce_p, l1_p, conf_err_p = self._pos_loss(
+                    dl_p, tl_p, tids_p, cconf_p
+                )
+
+            pos_w_sum = wmask_p.sum() + 1e-6
+            ce_loss = ce_loss + (ce_p * wmask_p).sum()
+            position_metrics[f"mtp_{position + 1}_loss"] = (
+                (ce_p * wmask_p).sum() / pos_w_sum
+            ).detach()
+            if self.dspark_l1_loss_alpha > 0:
+                l1_loss = l1_loss + (l1_p * wmask_p).sum()
+            if confidence_pred is not None:
+                confidence_loss = confidence_loss + (conf_err_p * wmask_p).sum()
+                with torch.no_grad():
+                    accept_p = (1.0 - 0.5 * l1_p).clamp(0.0, 1.0)
+                    confidence_abs_error = confidence_abs_error + (
+                        (cconf_p.float().sigmoid() - accept_p).abs() * wmask_p
+                    ).sum()
+
+        ce_loss = ce_loss / (ce_loss_den + 1e-6)
+        l1_loss = l1_loss / (ce_loss_den + 1e-6)
+        confidence_loss = confidence_loss / (ce_loss_den + 1e-6)
+        confidence_abs_error = confidence_abs_error / (ce_loss_den + 1e-6)
+        _dbg_mem("_compute_dspark_loss per-position loop done")
 
         loss = (
             self.dspark_ce_loss_alpha * ce_loss
