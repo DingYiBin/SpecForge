@@ -23,6 +23,26 @@ if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
 
+def _dbg_mem(tag: str) -> None:
+    """Print NPU/CUDA memory usage with a trailing newline, flushed, so
+    multi-rank output does not interleave. Active only on a torch.npu/cuda
+    device; otherwise a no-op."""
+    import torch.distributed as dist
+
+    dev = torch.npu if getattr(torch, "npu", None) and torch.npu.is_available() else (
+        torch.cuda if getattr(torch, "cuda", None) and torch.cuda.is_available() else None
+    )
+    if dev is None:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    msg = (
+        f"[dbg r{rank}] {tag}  "
+        f"allocated={dev.memory_allocated()/1024**3:.2f}GB  "
+        f"reserved={dev.memory_reserved()/1024**3:.2f}GB\n"
+    )
+    print(msg, end="", flush=True)
+
+
 _VALID_LOSS_TYPES = {
     "dflash",
     "dpace",
@@ -888,6 +908,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if target_last_hidden_states is None:
             return None
         target_pred_indices = (safe_label_indices - 1).clamp(min=0)
+        _dbg_mem("_aligned_target_logits enter")
         # Gather along the sequence axis only; avoid broadcasting the hidden
         # states across the anchor axis (would force a contiguous copy of
         # (bsz, num_anchors, seq_len, H) — tens of GiB for long sequences).
@@ -899,6 +920,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
             1,
             flat_idx.unsqueeze(-1).expand(-1, -1, H),
         ).view(bsz, num_anchors, block_size, H)
+        _dbg_mem("_aligned_target_logits after gather")
         return self.lm_head(aligned_target_hidden)
 
     def _compute_dspark_loss(
@@ -935,9 +957,20 @@ class OnlineDSparkModel(OnlineDFlashModel):
             self.dspark_l1_loss_alpha > 0 or confidence_pred is not None
         )
         if aligned_target_logits is not None and needs_target_distribution:
+            _dbg_mem("_compute_dspark_loss before softmax")
             draft_probs = torch.softmax(draft_logits.float(), dim=-1)
+            _dbg_mem("_compute_dspark_loss after draft softmax")
             target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-            l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+            _dbg_mem("_compute_dspark_loss after target softmax")
+            # Reuse draft_probs as the diff buffer (in-place sub + abs) to avoid
+            # allocating a separate (bsz, num_anchors, block_size, vocab) fp32
+            # tensor for the subtraction and abs — ~1.2 GiB each at
+            # 512x5x129280, which is what OOM'd here.
+            draft_probs.sub_(target_probs)
+            del target_probs
+            l1_dist = draft_probs.abs_().sum(dim=-1)
+            del draft_probs
+            _dbg_mem("_compute_dspark_loss after l1_dist")
             accept_rate_3d = 1.0 - 0.5 * l1_dist
             accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
             if self.dspark_l1_loss_alpha > 0:
