@@ -888,21 +888,17 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if target_last_hidden_states is None:
             return None
         target_pred_indices = (safe_label_indices - 1).clamp(min=0)
+        # Gather along the sequence axis only; avoid broadcasting the hidden
+        # states across the anchor axis (would force a contiguous copy of
+        # (bsz, num_anchors, seq_len, H) — tens of GiB for long sequences).
+        bsz, num_anchors, block_size = target_pred_indices.shape
+        H = target_last_hidden_states.size(-1)
+        flat_idx = target_pred_indices.reshape(bsz, num_anchors * block_size)
         aligned_target_hidden = torch.gather(
-            target_last_hidden_states.unsqueeze(1).expand(
-                -1,
-                safe_label_indices.size(1),
-                -1,
-                -1,
-            ),
-            2,
-            target_pred_indices.unsqueeze(-1).expand(
-                -1,
-                -1,
-                -1,
-                target_last_hidden_states.size(-1),
-            ),
-        )
+            target_last_hidden_states,
+            1,
+            flat_idx.unsqueeze(-1).expand(-1, -1, H),
+        ).view(bsz, num_anchors, block_size, H)
         return self.lm_head(aligned_target_hidden)
 
     def _compute_dspark_loss(
