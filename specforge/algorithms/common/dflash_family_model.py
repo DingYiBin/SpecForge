@@ -937,7 +937,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
         ``torch.utils.checkpoint`` so the (bsz, num_anchors, vocab) fp32
         softmaxes / CE upcast are recomputed in backward instead of being saved.
         """
-        ce = F.cross_entropy(dl_p, tids_p, reduction="none")  # (bsz, num_anchors)
+        # Flatten to 2D for cross_entropy: some PyTorch versions reject a
+        # 3D-logit / 2D-target pair with "expected target size [.., V]".
+        bsz, num_anchors = tids_p.shape
+        vocab = dl_p.size(-1)
+        ce = F.cross_entropy(
+            dl_p.reshape(bsz * num_anchors, vocab),
+            tids_p.reshape(-1),
+            reduction="none",
+        ).view(bsz, num_anchors)
         if tl_p is not None:
             l1 = (
                 torch.softmax(dl_p.float(), dim=-1)
