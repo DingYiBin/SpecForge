@@ -958,18 +958,21 @@ class OnlineDSparkModel(OnlineDFlashModel):
         )
         if aligned_target_logits is not None and needs_target_distribution:
             _dbg_mem("_compute_dspark_loss before softmax")
-            draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-            _dbg_mem("_compute_dspark_loss after draft softmax")
-            target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-            _dbg_mem("_compute_dspark_loss after target softmax")
-            # Reuse draft_probs as the diff buffer (in-place sub + abs) to avoid
-            # allocating a separate (bsz, num_anchors, block_size, vocab) fp32
-            # tensor for the subtraction and abs — ~1.2 GiB each at
-            # 512x5x129280, which is what OOM'd here.
-            draft_probs.sub_(target_probs)
-            del target_probs
-            l1_dist = draft_probs.abs_().sum(dim=-1)
-            del draft_probs
+            # Chunk over the anchor axis to bound peak memory: two full fp32
+            # softmaxes + diff + abs is ~5 GiB at 512x5x129280 and OOM'd here.
+            # All ops are out-of-place on purpose — in-place sub_/abs_ on the
+            # softmax output would corrupt softmax backward (it saves the
+            # output for gradient), breaking autograd.
+            l1_dist_parts = []
+            chunk = 64
+            n = draft_logits.size(1)
+            for start in range(0, n, chunk):
+                end = min(start + chunk, n)
+                dp = torch.softmax(draft_logits[:, start:end].float(), dim=-1)
+                tp = torch.softmax(aligned_target_logits[:, start:end].float(), dim=-1)
+                l1_dist_parts.append((dp - tp).abs().sum(dim=-1))
+                del dp, tp
+            l1_dist = torch.cat(l1_dist_parts, dim=1)
             _dbg_mem("_compute_dspark_loss after l1_dist")
             accept_rate_3d = 1.0 - 0.5 * l1_dist
             accept_rate_3d = accept_rate_3d.clamp_(0.0, 1.0)
