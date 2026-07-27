@@ -753,7 +753,7 @@ class OnlineDSparkModel(OnlineDFlashModel):
         dspark_ce_loss_alpha: float = 0.1,
         dspark_l1_loss_alpha: float = 0.9,
         dspark_confidence_head_alpha: float = 1.0,
-        recompute_loss: bool = True,
+        recompute_loss: bool = False,
     ):
         super().__init__(
             draft_model=draft_model,

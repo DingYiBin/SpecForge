@@ -507,9 +507,9 @@ class TrainingConfig(StrictConfigModel):
     dspark_confidence_head_alpha: float = 1.0
     #: Recompute the per-position DSpark loss (CE + L1 + confidence) under
     #: gradient checkpointing in backward to cut the loss-step memory peak.
-    #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` disables
+    #: ``true`` saves ~2.6 GiB at 512x5x129280; ``false`` (default) disables
     #: recomputation (faster, more memory).
-    recompute_loss: bool = True
+    recompute_loss: bool = False
     #: Activation checkpointing granularity: ``"stage"`` wraps the whole
     #: DSPark stage (attention + MoE), ``"attention"`` wraps only the
     #: attention module, ``"none"`` disables checkpointing entirely.
