@@ -299,11 +299,7 @@ class FSDPTrainingBackend(TrainingBackend):
                         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
                         limit_all_gathers=True,
                     )
-                if hasattr(torch, "npu") and torch.npu.is_available():
-                    print(f"[dbg] BEFORE FSDP              allocated={torch.npu.memory_allocated()/1024**3:.2f}GB  reserved={torch.npu.memory_reserved()/1024**3:.2f}GB")
                 model = FSDP(model, **fsdp_kwargs)
-                if hasattr(torch, "npu") and torch.npu.is_available():
-                    print(f"[dbg] FSDP done                allocated={torch.npu.memory_allocated()/1024**3:.2f}GB  reserved={torch.npu.memory_reserved()/1024**3:.2f}GB")
                 # Apply activation checkpointing AFTER FSDP wrapping so the
                 # checkpoint wrapper sits *inside* the FSDP unit.  During
                 # forward FSDP all-gathers params, the inner module runs

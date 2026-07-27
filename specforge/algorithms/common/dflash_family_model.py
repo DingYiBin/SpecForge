@@ -24,26 +24,6 @@ if hasattr(torch, "npu") and torch.npu.is_available():
     FLEX_ATTENTION_AVAILABLE = False
 
 
-def _dbg_mem(tag: str) -> None:
-    """Print NPU/CUDA memory usage with a trailing newline, flushed, so
-    multi-rank output does not interleave. Active only on a torch.npu/cuda
-    device; otherwise a no-op."""
-    import torch.distributed as dist
-
-    dev = torch.npu if getattr(torch, "npu", None) and torch.npu.is_available() else (
-        torch.cuda if getattr(torch, "cuda", None) and torch.cuda.is_available() else None
-    )
-    if dev is None:
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    msg = (
-        f"[dbg r{rank}] {tag}  "
-        f"allocated={dev.memory_allocated()/1024**3:.2f}GB  "
-        f"reserved={dev.memory_reserved()/1024**3:.2f}GB\n"
-    )
-    print(msg, end="", flush=True)
-
-
 _VALID_LOSS_TYPES = {
     "dflash",
     "dpace",
@@ -911,7 +891,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         if target_last_hidden_states is None:
             return None
         target_pred_indices = (safe_label_indices - 1).clamp(min=0)
-        _dbg_mem("_aligned_target_logits enter")
         # Gather along the sequence axis only; avoid broadcasting the hidden
         # states across the anchor axis (would force a contiguous copy of
         # (bsz, num_anchors, seq_len, H) — tens of GiB for long sequences).
@@ -923,7 +902,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
             1,
             flat_idx.unsqueeze(-1).expand(-1, -1, H),
         ).view(bsz, num_anchors, block_size, H)
-        _dbg_mem("_aligned_target_logits after gather")
         return self.lm_head(aligned_target_hidden)
 
     def _pos_loss(
@@ -991,7 +969,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
                 "consumer receives target_last_hidden_states."
             )
 
-        _dbg_mem("_compute_dspark_loss per-position loop enter")
         for position in range(block_size):
             dl_p = draft_logits[:, :, position, :]
             # Only compute the target distribution when it's actually needed
@@ -1042,7 +1019,6 @@ class OnlineDSparkModel(OnlineDFlashModel):
         l1_loss = l1_loss / (ce_loss_den + 1e-6)
         confidence_loss = confidence_loss / (ce_loss_den + 1e-6)
         confidence_abs_error = confidence_abs_error / (ce_loss_den + 1e-6)
-        _dbg_mem("_compute_dspark_loss per-position loop done")
 
         loss = (
             self.dspark_ce_loss_alpha * ce_loss
