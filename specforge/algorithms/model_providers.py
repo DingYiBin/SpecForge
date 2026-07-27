@@ -22,6 +22,7 @@ remain inside callables so resolving the algorithm registry stays import-light.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -61,6 +62,12 @@ def _device():
     return get_local_device()
 
 
+def _flag(name: str) -> bool:
+    """Read a boolean environment variable; false when absent or '0'/'false'."""
+    val = os.environ.get(name)
+    return val is not None and val.lower() not in ("0", "false", "no", "off")
+
+
 def _warm_start(
     cfg: Config,
     draft_model: Any,
@@ -70,6 +77,16 @@ def _warm_start(
 ) -> None:
     if not cfg.model.draft_checkpoint_path:
         return
+
+    # FSDP FULL_SHARD broadcasts module states from rank 0 during wrapping
+    # (sync_module_states=True).  When the HCCL backend correctly supports
+    # large-tensor broadcast we can load on rank 0 only and skip 8× disk
+    # I/O + CPU dequantization.  Opt-in via SPECFORGE_RANK0_WARMSTART=1.
+    if _flag("SPECFORGE_RANK0_WARMSTART"):
+        import torch.distributed as dist
+
+        if dist.is_initialized() and dist.get_rank() != 0:
+            return
     from specforge.training.model_loading import warm_start_draft_model
 
     warm_start_draft_model(
@@ -436,6 +453,7 @@ def build_dspark_model(
                 cfg.training.dspark_opd_logprob_min_clamp
             ),
             dspark_opd_loss_max_clamp=cfg.training.dspark_opd_loss_max_clamp,
+            recompute_loss=cfg.training.recompute_loss,
         ),
     )
 
