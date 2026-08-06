@@ -510,10 +510,18 @@ class DSparkTrainStrategy(DraftTrainStrategy):
             ):
                 if name in model_metrics:
                     metrics[name] = model_metrics[name]
+        loss_mode = getattr(self.dspark_model, "dspark_loss_mode", "original")
+        loss_metric_names = (
+            ("kl_loss",)
+            if loss_mode == "kl"
+            else (
+                "ce_loss",
+                "l1_loss",
+            )
+        )
         for name in (
             "accuracy_denom",
-            "ce_loss",
-            "l1_loss",
+            *loss_metric_names,
             "confidence_loss",
             "confidence_abs_error",
             "opd_loss",
