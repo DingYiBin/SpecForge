@@ -277,6 +277,7 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
     ) -> None:
         super().__init__(config)
         self.config = config
+        self.context_window = config.sliding_window
         kernels = dflash_kernels or DEFAULT_DFLASH_KERNELS
         self.layers = nn.ModuleList(
             [
