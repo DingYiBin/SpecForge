@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generate on-policy preformatted training responses with a target-only vLLM server."""
+"""Generate on-policy training responses with a target vLLM completions server.
+
+Each input row must contain ``conversations`` (role/content). The last
+assistant turn is dropped, the remainder is rendered with
+``apply_chat_template(..., add_generation_prompt=True)``, and the request goes
+to ``/v1/completions`` so ``--collect-spec-decode-trace`` keeps working.
+Each output row stores the prefix plus the new assistant turn as
+``conversations``. Downstream dump and training apply the chat template again.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +39,6 @@ from specforge.utils import load_tokenizer
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ASSISTANT_MARKER = "<｜Assistant｜>"
 DEFAULT_END_MARKER = "<｜end▁of▁sentence｜>"
 
 
@@ -42,6 +49,7 @@ class RolloutJob:
     source_line: int
     prompt: str
     max_tokens: int
+    conversations_prefix: tuple[dict[str, str], ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,8 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url", default="http://127.0.0.1:8000")
     parser.add_argument("--model", default="DeepSeek-V4-Flash-DSpark")
     parser.add_argument("--tokenizer-path", required=True)
-    parser.add_argument("--prompt-field", default="text")
-    parser.add_argument("--assistant-marker", default=DEFAULT_ASSISTANT_MARKER)
     parser.add_argument("--end-marker", default=DEFAULT_END_MARKER)
     parser.add_argument("--max-length", type=int, default=128000)
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -70,6 +76,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-truncated", action="store_true")
     parser.add_argument("--collect-spec-decode-trace", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Pass enable_thinking=False to apply_chat_template.",
+    )
     return parser.parse_args()
 
 
@@ -123,20 +134,47 @@ def load_completed_rows(output_path: Path) -> set[int]:
     return completed
 
 
-def build_prompt(
-    row: dict[str, Any],
+def _copy_messages(messages: list[Any]) -> list[dict[str, str]]:
+    copied: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("each conversation item must be an object")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise ValueError("conversation items need string role and content")
+        copied.append({"role": role, "content": content})
+    return copied
+
+
+def prompt_from_conversations(
+    tokenizer: Any,
+    conversations: Any,
     *,
-    prompt_field: str,
-    assistant_marker: str,
-) -> str:
-    """Remove the existing last assistant response from a preformatted row."""
-    text = row.get(prompt_field)
-    if not isinstance(text, str) or not text:
-        raise ValueError(f"{prompt_field!r} is not a non-empty string")
-    marker_pos = text.rfind(assistant_marker)
-    if marker_pos < 0:
-        raise ValueError(f"missing assistant marker: {assistant_marker}")
-    return text[: marker_pos + len(assistant_marker)]
+    disable_thinking: bool,
+) -> tuple[str, tuple[dict[str, str], ...]]:
+    """Drop the last assistant turn and render a generation prompt."""
+    if not isinstance(conversations, list) or not conversations:
+        raise ValueError("conversations must be a non-empty list")
+    messages = _copy_messages(conversations)
+    if messages[-1]["role"] == "assistant":
+        prefix = messages[:-1]
+    else:
+        prefix = messages
+    if not prefix or prefix[-1]["role"] != "user":
+        raise ValueError("conversation prompt must end on a user turn")
+    kwargs: dict[str, Any] = {}
+    if disable_thinking:
+        kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+    prompt = tokenizer.apply_chat_template(
+        prefix,
+        tokenize=False,
+        add_generation_prompt=True,
+        **kwargs,
+    )
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("apply_chat_template returned an empty generation prompt")
+    return prompt, tuple(prefix)
 
 
 def post_completion(
@@ -260,7 +298,7 @@ def request_with_retries(
 
 
 def run(args: argparse.Namespace) -> None:
-    """Generate target responses and write resumable preformatted JSONL."""
+    """Generate target responses and write resumable conversations JSONL."""
     validate_args(args)
     tokenizer = load_tokenizer(
         args.tokenizer_path,
@@ -273,6 +311,7 @@ def run(args: argparse.Namespace) -> None:
     selected = 0
     written = 0
     skipped_completed = 0
+    skipped_overlong = 0
     dropped_truncated = 0
     started = time.perf_counter()
     mode = "a" if args.resume else "x"
@@ -289,35 +328,38 @@ def run(args: argparse.Namespace) -> None:
             dropped_truncated += 1
             return
 
-        rollout_text = job.prompt + result["output_text"]
-        if finish_reason != "length" and not rollout_text.endswith(args.end_marker):
-            rollout_text += args.end_marker
         target_rollout = {
             "finish_reason": finish_reason,
             "prompt_tokens": result["prompt_tokens"],
             "completion_tokens": result["completion_tokens"],
+            "enable_thinking": not args.disable_thinking,
         }
         if result["spec_decode"] is not None:
             target_rollout["spec_decode"] = result["spec_decode"]
+        assistant_content = result["output_text"]
+        if args.end_marker and assistant_content.endswith(args.end_marker):
+            assistant_content = assistant_content[: -len(args.end_marker)]
+        payload: dict[str, Any] = {
+            "conversations": [
+                dict(message) for message in job.conversations_prefix
+            ]
+            + [{"role": "assistant", "content": assistant_content}],
+            "source_line_number": job.source_line,
+            "target_rollout": target_rollout,
+        }
         output_handle.write(
-            json.dumps(
-                {
-                    "text": rollout_text,
-                    "source_line_number": job.source_line,
-                    "target_rollout": target_rollout,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
+            json.dumps(payload, ensure_ascii=False) + "\n"
         )
         output_handle.flush()
         written += 1
         if args.log_interval > 0 and written % args.log_interval == 0:
             elapsed = max(time.perf_counter() - started, 1e-6)
             logger.info(
-                "written=%d skipped_completed=%d dropped_truncated=%d rows/s=%.3f",
+                "written=%d skipped_completed=%d skipped_overlong=%d "
+                "dropped_truncated=%d rows/s=%.3f",
                 written,
                 skipped_completed,
+                skipped_overlong,
                 dropped_truncated,
                 written / elapsed,
             )
@@ -344,23 +386,29 @@ def run(args: argparse.Namespace) -> None:
                 raise ValueError(f"invalid JSON at source line {source_line}: {exc}") from exc
             if not isinstance(row, dict):
                 raise ValueError(f"source line {source_line} is not a JSON object")
-            prompt = build_prompt(
-                row,
-                prompt_field=args.prompt_field,
-                assistant_marker=args.assistant_marker,
+            prompt, conversations_prefix = prompt_from_conversations(
+                tokenizer,
+                row.get("conversations"),
+                disable_thinking=args.disable_thinking,
             )
             prompt_token_count = len(tokenizer.encode(prompt, add_special_tokens=False))
             available_tokens = args.max_length - prompt_token_count
             if available_tokens <= 0:
-                raise ValueError(
-                    f"source line {source_line} prompt has {prompt_token_count} tokens, "
-                    f"which reaches --max-length={args.max_length}"
+                skipped_overlong += 1
+                logger.warning(
+                    "skip source line %d: prompt has %d tokens, "
+                    "reaches --max-length=%d",
+                    source_line,
+                    prompt_token_count,
+                    args.max_length,
                 )
+                continue
             request_max_tokens = min(args.max_tokens, available_tokens)
             job = RolloutJob(
                 source_line=source_line,
                 prompt=prompt,
                 max_tokens=request_max_tokens,
+                conversations_prefix=conversations_prefix,
             )
             future = executor.submit(
                 request_with_retries,
@@ -382,6 +430,7 @@ def run(args: argparse.Namespace) -> None:
     logger.info("Selected source rows: %d", selected)
     logger.info("Written rollouts: %d", written)
     logger.info("Already completed: %d", skipped_completed)
+    logger.info("Skipped overlong prompts: %d", skipped_overlong)
     logger.info("Dropped truncated rollouts: %d", dropped_truncated)
     logger.info("Saved target rollouts to %s", args.output_path)
 

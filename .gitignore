@@ -195,6 +195,7 @@ cache/
 exports/
 outputs/
 wandb/
+.cursor/
 .idea
 .vscode/
 
