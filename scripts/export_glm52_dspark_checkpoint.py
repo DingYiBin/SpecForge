@@ -98,6 +98,23 @@ def _infer_num_layers(tensors: dict[str, torch.Tensor]) -> int:
     return max(indices) + 1
 
 
+def _drop_target_layer_lists(config: dict[str, Any], *, num_layers: int) -> None:
+    """Drop 78-wide GLM target lists; draft is 3 dense SWA layers."""
+    original_layers = int(config.get("num_hidden_layers") or 0)
+    for key, value in list(config.items()):
+        if not isinstance(value, list):
+            continue
+        drop = False
+        if key.endswith("layer_types") or key == "moe_layer_freq":
+            drop = len(value) != num_layers
+        elif original_layers and original_layers != num_layers and len(value) == original_layers:
+            drop = True
+        if drop:
+            config.pop(key, None)
+    config["layer_types"] = ["sliding_attention"] * num_layers
+    config["mlp_layer_types"] = ["dense"] * num_layers
+
+
 def _load_mtp_tensors(checkpoint: str) -> dict[str, torch.Tensor]:
     state = resolve_training_state(checkpoint)
     draft_state = state.get("draft_state_dict")
@@ -158,6 +175,18 @@ def _build_config(
         )
 
     hidden_size = int(config["hidden_size"])
+    num_layers = int(method["num_layers"])
+    # Target GLM-5.2 config still has 78-layer fields (layer_types,
+    # mlp_layer_types, NVFP4 quantization, native MTP). A 3-layer dense
+    # draft cannot keep them: transformers rejects mismatched *layer_types.
+    for key in (
+        "quantization_config",
+        "quantization",
+        "num_nextn_predict_layers",
+        "auto_map",
+    ):
+        config.pop(key, None)
+    _drop_target_layer_lists(config, num_layers=num_layers)
     config["architectures"] = ["Glm52DSparkDraftModel"]
     config["model_type"] = "glm52_dspark"
     config["dflash_config"] = method
@@ -165,7 +194,7 @@ def _build_config(
     config["target_layer_ids"] = aux_ids
     config["num_target_layers"] = len(aux_ids)
     config["target_hidden_size"] = hidden_size
-    config["num_hidden_layers"] = int(method["num_layers"])
+    config["num_hidden_layers"] = num_layers
     config["n_routed_experts"] = 0
     config["n_shared_experts"] = 0
     config["num_experts_per_tok"] = 0

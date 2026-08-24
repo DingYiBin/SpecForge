@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Send preformatted prompts to vLLM and measure DSpark acceptance rates."""
+"""Send conversation prompts to vLLM and measure DSpark acceptance rates.
+
+Each JSONL row must contain ``conversations`` (role/content). The last
+assistant turn is dropped if present; the remainder is rendered with
+``apply_chat_template(..., add_generation_prompt=True)`` and posted to
+``/v1/completions``.
+"""
 
 from __future__ import annotations
 
@@ -31,8 +37,6 @@ from specforge.utils import load_tokenizer
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ASSISTANT_MARKER = "<｜Assistant｜>"
-
 
 @dataclass
 class SpecDecodeMetrics:
@@ -48,21 +52,37 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", type=Path, required=True)
     parser.add_argument("--server-url", default="http://127.0.0.1:8000")
-    parser.add_argument("--model", default="DeepSeek-V4-Flash-DSpark")
-    parser.add_argument("--prompt-field", default="text")
-    parser.add_argument("--assistant-marker", default=DEFAULT_ASSISTANT_MARKER)
+    parser.add_argument("--model", default="GLM-5.2")
+    parser.add_argument(
+        "--tokenizer-path",
+        required=True,
+        help="Tokenizer used for apply_chat_template and optional input previews.",
+    )
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0, help="0 means all rows")
     parser.add_argument("--concurrency", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument(
-        "--tokenizer-path",
-        default=None,
-        help="Tokenizer used to save the prompt's final input tokens.",
+        "--truncate-prompt-tokens",
+        type=int,
+        default=131072,
+        help=(
+            "Keep at most this many prompt tokens (vLLM truncate_prompt_tokens). "
+            "Default 131072 (128K). Pass 16384 for 16K. Pass 0 to disable."
+        ),
     )
+    parser.add_argument(
+        "--truncation-side",
+        choices=("left", "right"),
+        default="left",
+        help=(
+            "Which side to truncate when --truncate-prompt-tokens is set. "
+            "'left' keeps the last N tokens (default)."
+        ),
+    )
+    parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument(
         "--input-preview-tokens",
         type=int,
@@ -70,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of trailing prompt tokens to save in each output record.",
     )
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Pass enable_thinking=False to apply_chat_template.",
+    )
     parser.add_argument(
         "--stop",
         action="append",
@@ -80,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "--output-jsonl",
         type=Path,
         default=None,
-        help="Optional file for request/response summaries.",
+        help="Write per-request summaries (including output_text) to this JSONL.",
     )
     parser.add_argument(
         "--log-interval",
@@ -102,43 +127,69 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--concurrency must be > 0")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be > 0")
+    if args.truncate_prompt_tokens < 0:
+        raise ValueError("--truncate-prompt-tokens must be >= 0 (0 disables)")
     if args.request_timeout <= 0:
         raise ValueError("--request-timeout must be > 0")
     if args.input_preview_tokens < 0:
         raise ValueError("--input-preview-tokens must be >= 0")
-    if (
-        args.input_preview_tokens > 0
-        and args.output_jsonl is not None
-        and not args.tokenizer_path
-    ):
-        raise ValueError(
-            "--tokenizer-path is required when saving token-based input previews"
-        )
-    if not args.assistant_marker:
-        raise ValueError("--assistant-marker must not be empty")
     if args.output_jsonl is not None and args.output_jsonl.exists():
         raise ValueError(f"refusing to overwrite output file: {args.output_jsonl}")
 
 
-def build_prompt(row: dict[str, Any], *, prompt_field: str, assistant_marker: str) -> str | None:
-    text = row.get(prompt_field)
-    if not isinstance(text, str):
-        return None
-    marker_pos = text.rfind(assistant_marker)
-    if marker_pos < 0:
-        return None
-    return text[: marker_pos + len(assistant_marker)]
+def _copy_messages(messages: list[Any]) -> list[dict[str, str]]:
+    copied: list[dict[str, str]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ValueError("each conversation item must be an object")
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            raise ValueError("conversation items need string role and content")
+        copied.append({"role": role, "content": content})
+    return copied
+
+
+def prompt_from_conversations(
+    tokenizer: Any,
+    conversations: Any,
+    *,
+    disable_thinking: bool,
+) -> str:
+    """Drop the last assistant turn and render a generation prompt."""
+    if not isinstance(conversations, list) or not conversations:
+        raise ValueError("conversations must be a non-empty list")
+    messages = _copy_messages(conversations)
+    if messages[-1]["role"] == "assistant":
+        prefix = messages[:-1]
+    else:
+        prefix = messages
+    if not prefix or prefix[-1]["role"] != "user":
+        raise ValueError("conversation prompt must end on a user turn")
+    kwargs: dict[str, Any] = {}
+    if disable_thinking:
+        kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+    prompt = tokenizer.apply_chat_template(
+        prefix,
+        tokenize=False,
+        add_generation_prompt=True,
+        **kwargs,
+    )
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("apply_chat_template returned an empty generation prompt")
+    return prompt
 
 
 def iter_prompts(
     data_path: Path,
     *,
-    prompt_field: str,
-    assistant_marker: str,
+    tokenizer: Any,
+    disable_thinking: bool,
     start_index: int,
     limit: int,
 ):
     emitted = 0
+    skip_logged = 0
     with data_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             if line_number <= start_index:
@@ -156,13 +207,22 @@ def iter_prompts(
             if not isinstance(row, dict):
                 yield line_number, None, "invalid_row"
                 continue
-            prompt = build_prompt(
-                row,
-                prompt_field=prompt_field,
-                assistant_marker=assistant_marker,
-            )
-            if prompt is None:
-                yield line_number, None, "missing_prompt_or_marker"
+            try:
+                prompt = prompt_from_conversations(
+                    tokenizer,
+                    row.get("conversations"),
+                    disable_thinking=disable_thinking,
+                )
+            except (ValueError, TypeError) as exc:
+                if skip_logged < 5:
+                    logger.warning(
+                        "line %d skipped: %s; row keys=%s",
+                        line_number,
+                        exc,
+                        sorted(row.keys()),
+                    )
+                    skip_logged += 1
+                yield line_number, None, "bad_conversations"
                 continue
             emitted += 1
             yield line_number, prompt, None
@@ -178,6 +238,8 @@ def post_completion(
     top_p: float,
     stop: list[str] | None,
     timeout: float,
+    truncate_prompt_tokens: int = 0,
+    truncation_side: str = "left",
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -186,6 +248,9 @@ def post_completion(
         "temperature": temperature,
         "top_p": top_p,
     }
+    if truncate_prompt_tokens > 0:
+        payload["truncate_prompt_tokens"] = truncate_prompt_tokens
+        payload["truncation_side"] = truncation_side
     if stop:
         payload["stop"] = stop
 
@@ -207,6 +272,13 @@ def post_completion(
     usage = parsed.get("usage", {}) if isinstance(parsed, dict) else {}
     choices = parsed.get("choices", []) if isinstance(parsed, dict) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    output_text = choice.get("text")
+    if not isinstance(output_text, str):
+        message = choice.get("message")
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            output_text = message["content"]
+        else:
+            output_text = None
     spec_decode = parsed.get("spec_decode") if isinstance(parsed, dict) else None
     spec_decode_metrics = None
     if isinstance(spec_decode, dict):
@@ -221,7 +293,7 @@ def post_completion(
         "elapsed_sec": elapsed,
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
-        "output_text": choice.get("text"),
+        "output_text": output_text,
         "finish_reason": choice.get("finish_reason"),
         "spec_decode_metrics": spec_decode_metrics,
     }
@@ -415,10 +487,7 @@ def drain_completed(
         }
         if spec_decode_metrics is not None:
             output_record["spec_decode"] = serialize_metrics(spec_decode_metrics)
-        write_jsonl(
-            output_handle,
-            output_record,
-        )
+        write_jsonl(output_handle, output_record)
 
         completed = stats["completed"]
         if log_interval > 0 and completed % log_interval == 0:
@@ -438,24 +507,23 @@ def run(args: argparse.Namespace) -> Counter:
     endpoint = args.server_url.rstrip("/") + "/v1/completions"
     stats: Counter = Counter()
     started_at = time.perf_counter()
-    tokenizer = None
-    if args.tokenizer_path:
-        tokenizer = load_tokenizer(
-            args.tokenizer_path,
-            trust_remote_code=args.trust_remote_code,
-        )
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        trust_remote_code=args.trust_remote_code,
+    )
     output_handle = None
     if args.output_jsonl is not None:
         args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
         output_handle = args.output_jsonl.open("x", encoding="utf-8")
+        logger.info("Writing request outputs to %s", args.output_jsonl)
 
     try:
         with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
             pending: set[Future] = set()
             for line_number, prompt, skip_reason in iter_prompts(
                 args.data_path,
-                prompt_field=args.prompt_field,
-                assistant_marker=args.assistant_marker,
+                tokenizer=tokenizer,
+                disable_thinking=args.disable_thinking,
                 start_index=args.start_index,
                 limit=args.limit,
             ):
@@ -476,7 +544,7 @@ def run(args: argparse.Namespace) -> Counter:
                 stats["submitted"] += 1
                 input_tail = None
                 input_tail_tokens = 0
-                if tokenizer is not None and args.input_preview_tokens > 0:
+                if args.input_preview_tokens > 0:
                     prompt_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
                     tail_token_ids = prompt_token_ids[-args.input_preview_tokens :]
                     input_tail = tokenizer.decode(tail_token_ids)
@@ -491,6 +559,8 @@ def run(args: argparse.Namespace) -> Counter:
                     top_p=args.top_p,
                     stop=args.stop,
                     timeout=args.request_timeout,
+                    truncate_prompt_tokens=args.truncate_prompt_tokens,
+                    truncation_side=args.truncation_side,
                 )
                 setattr(future, "line_number", line_number)
                 setattr(future, "input_tail", input_tail)
