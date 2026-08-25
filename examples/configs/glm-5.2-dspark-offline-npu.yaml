@@ -1,0 +1,42 @@
+model:
+  target_model_path: RedHatAI/GLM-5.2-NVFP4-FP8
+  draft_model_config: configs/glm-5.2-dspark.json
+  draft_checkpoint_path: /path/to/GLM-5.2-speculator.dspark
+  torch_dtype: bfloat16
+  trust_remote_code: true
+
+data:
+  hidden_states_path: /path/to/glm-5.2-dspark-hidden-states
+  max_length: 2176
+
+training:
+  strategy: dspark
+  # Ascend NPU has no flex_attention. SDPA consumes the dense boolean
+  # DFlash-family mask for the generic Qwen3 DSpark draft.
+  attention_backend: sdpa
+  fsdp_sharding: FULL_SHARD
+  batch_size: 1
+  num_anchors: 128
+  dspark_loss_mode: original
+  dspark_ce_loss_alpha: 0.1
+  dspark_l1_loss_alpha: 0.9
+  dspark_kl_loss_alpha: 1.0
+  dspark_confidence_head_alpha: 1.0
+  recompute_loss: false
+  activation_checkpointing: "attention"
+  save_interval: 1000
+  log_interval: 1
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+run_id: glm-5.2-dspark-npu-offline
+output_dir: ./outputs/glm-5.2-dspark-npu-offline
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 16
