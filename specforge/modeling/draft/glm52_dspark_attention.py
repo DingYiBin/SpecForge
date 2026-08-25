@@ -26,12 +26,13 @@ from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaRotaryEmbedding,
 )
 
-from .flex_attention import compile_friendly_flex_attention
-
 try:
     from torch.nn.attention.flex_attention import BlockMask
+
+    from .flex_attention import compile_friendly_flex_attention
 except ImportError:
     BlockMask = None
+    compile_friendly_flex_attention = None
 
 
 def _method_config(config: GlmMoeDsaConfig) -> dict:
@@ -356,6 +357,11 @@ class Glm52DSparkAttention(nn.Module):
         attention_mask,
     ) -> torch.Tensor:
         if BlockMask is not None and isinstance(attention_mask, BlockMask):
+            if compile_friendly_flex_attention is None:
+                raise ValueError(
+                    "flex_attention is not available on this device; "
+                    "use attention_backend=eager or sdpa."
+                )
             return compile_friendly_flex_attention(
                 query,
                 key,
@@ -366,8 +372,9 @@ class Glm52DSparkAttention(nn.Module):
         if isinstance(attention_mask, torch.Tensor):
             return self._dense_attention(query, key, value, attention_mask)
         raise ValueError(
-            "GLM-5.2 DSpark requires a Flex Attention BlockMask or a dense "
-            f"tensor mask; got {type(attention_mask).__name__}"
+            "GLM-5.2 DSpark requires attention_backend=flex_attention or "
+            "sdpa/eager (dense boolean mask); got "
+            f"{type(attention_mask).__name__}"
         )
 
     def forward(

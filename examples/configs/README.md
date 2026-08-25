@@ -443,11 +443,13 @@ TensorBoard, SwanLab, or MLflow.
 Install vendor-matched PyTorch, `torch_npu`, Mooncake, and an NPU-compatible
 SGLang capture server first. The checked-in `requirements-npu.txt` pins
 `torch==2.11.0` plus a matching `torch_npu`; install it before `pip install -e .`.
-The `*-npu.yaml` consumers use SDPA while target
-capture remains outside the trainer. DeepSeek-V4 DSpark offline adds an SDPA
+The `*-npu.yaml` consumers use SDPA or eager while target
+capture remains outside the trainer. DeepSeek-V4 DSpark offline adds an eager
 dense-attention fallback (`_dense_attention`) selected by
-`attention_backend: sdpa`; see
+`attention_backend: eager`; see
 [`deepseek-v4-flash-dspark-offline-npu.yaml`](deepseek-v4-flash-dspark-offline-npu.yaml).
+GLM-5.2 DSpark offline uses the same `eager` path after expanding MLA to MHA;
+see [`glm-5.2-dspark-offline-npu.yaml`](glm-5.2-dspark-offline-npu.yaml).
 For example:
 
 ```bash

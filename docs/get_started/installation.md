@@ -66,9 +66,10 @@ the exact `torch_npu` patch to the release that matches torch 2.11.0. The
 checked-in
 [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml),
 [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml),
+[`deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml),
 and
-[`deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml)
-recipes use external SGLang server capture with SDPA consumers. `sglang` is a
+[`glm-5.2-dspark-offline-npu.yaml`](../../examples/configs/glm-5.2-dspark-offline-npu.yaml)
+recipes use external SGLang server capture with SDPA or eager consumers. `sglang` is a
 hard import dependency: the stock wheel satisfies offline-training imports,
 but online capture requires an NPU-compatible SGLang/Mooncake service. The
 unified launcher detects the NPU device, self-launches the process count

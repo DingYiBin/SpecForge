@@ -1,0 +1,51 @@
+model:
+  target_model_path: "/path/to/GLM-5.2"
+  draft_model_config: "configs/glm-5.2-dspark.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  lm_head_key: "lm_head.weight"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+  # Dense attention chunk size, default 256. Lower this (32) if long
+  # sequences / many anchors OOM. GLM expands MLA to 64-head MHA, so
+  # activations are larger than DeepSeek-V4's shared-KV MQA.
+  attention_chunk_size: 64
+
+data:
+  hidden_states_path: "./cache/hidden_states/glm-5.2-dspark"
+  max_length: 4096
+  cache_dir: "./cache"
+  dataloader_num_workers: 0
+
+training:
+  strategy: "dspark"
+  # Ascend NPU has no flex_attention; eager selects the dense
+  # block-diagonal path in Glm52DSparkAttention._dense_attention.
+  attention_backend: eager
+  fsdp_sharding: "FULL_SHARD"
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.0
+  max_grad_norm: 0.5
+  tp_size: 1
+  num_anchors: 32
+  dspark_ce_loss_alpha: 1.0
+  dspark_l1_loss_alpha: 0.9
+  dspark_confidence_head_alpha: 1.0
+  # "attention" checkpoints Glm52DSparkAttention; use "stage" or lower
+  # attention_chunk_size / num_anchors / max_length if still OOM.
+  activation_checkpointing: "attention"
+  save_interval: 1000
+  log_interval: 50
+  dist_timeout: 120
+  seed: 42
+
+run_id: "glm-5.2-dspark-offline-npu"
+output_dir: "./outputs/glm-5.2-dspark-offline-npu"
+
+deployment:
+  mode: "local_colocated"
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

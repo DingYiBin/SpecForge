@@ -50,6 +50,40 @@ uv run specforge train \
 The configured dense draft is substantially larger than a tiny smoke model.
 Keep `FULL_SHARD` and one draft stage per FSDP unit for the first GPU run.
 
+## Train on Ascend NPU
+
+GPU training uses `flex_attention`. Ascend NPU does not provide that kernel,
+and the GLM draft must also import without Flex: `Glm52DSparkAttention` now
+guards the Flex import the same way DeepSeek-V4 DSpark does. Set
+`attention_backend: eager` so the trainer builds a boolean mask with
+`create_dflash_sdpa_mask` and runs `Glm52DSparkAttention._dense_attention`
+(MLA expanded to 64-head MHA, then split softmax over context `Q×S` and
+draft `5×5` blocks). Do not set `flex_attention` on NPU.
+
+A ready-made recipe is
+[`examples/configs/glm-5.2-dspark-offline-npu.yaml`](../../examples/configs/glm-5.2-dspark-offline-npu.yaml).
+It uses `eager`, `model.attention_chunk_size: 64`, and
+`training.activation_checkpointing: attention`. Install the vendor-matched
+PyTorch and `torch_npu` packages first, then launch:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export HCCL_CONNECT_TIMEOUT=7200
+export HCCL_EXEC_TIMEOUT=7200
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+
+specforge train -c examples/configs/glm-5.2-dspark-offline-npu.yaml \
+  model.target_model_path=/path/to/GLM-5.2 \
+  data.hidden_states_path=/path/to/glm-5.2-hidden-states
+```
+
+The runtime auto-detects NPU via `torch.npu.is_available()` (or honor
+`SPECFORGE_DEVICE=npu`). Capture hidden states on an NPU-compatible SGLang
+service, or capture on CUDA and point `data.hidden_states_path` at the
+exported features. GLM's expanded K/V is larger than DeepSeek-V4's shared-KV
+MQA; if attention OOMs, lower `model.attention_chunk_size`,
+`training.num_anchors`, or `data.max_length`.
+
 ## Resume a complete training run
 
 Resume from a SpecForge checkpoint to restore draft weights, optimizer,

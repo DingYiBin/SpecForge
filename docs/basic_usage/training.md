@@ -207,6 +207,7 @@ The checked-in examples are the canonical starting points:
 | Ascend NPU DFlash online | [`qwen3.5-4b-dflash-online-npu.yaml`](../../examples/configs/qwen3.5-4b-dflash-online-npu.yaml) |
 | Ascend NPU Domino online | [`qwen3.5-4b-domino-online-npu.yaml`](../../examples/configs/qwen3.5-4b-domino-online-npu.yaml) |
 | Ascend NPU DSpark offline | [`deepseek-v4-flash-dspark-offline-npu.yaml`](../../examples/configs/deepseek-v4-flash-dspark-offline-npu.yaml) |
+| Ascend NPU GLM-5.2 DSpark offline | [`glm-5.2-dspark-offline-npu.yaml`](../../examples/configs/glm-5.2-dspark-offline-npu.yaml) |
 
 ## Online and offline data
 

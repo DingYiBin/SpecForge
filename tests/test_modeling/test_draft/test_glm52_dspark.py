@@ -1,8 +1,11 @@
 # coding=utf-8
 """GLM-5.2 MLA+SWA DSpark attention and draft-model tests."""
 
+import importlib
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import torch
 
@@ -42,6 +45,16 @@ class _FakeAttention:
         self.block_size = block_size
         self.v_head_dim = value_dim
         self.attention_chunk_size = chunk_size
+
+
+def _dispatch_host(attention_cls, **kwargs):
+    host = _FakeAttention(**kwargs)
+    host._dense_attention = (
+        lambda query, key, value, attention_mask, _cls=attention_cls, _self=host: (
+            _cls._dense_attention(_self, query, key, value, attention_mask)
+        )
+    )
+    return host
 
 
 def _naive_attention(fake, query, key, value, mask):
@@ -189,6 +202,125 @@ class Glm52DSparkAttentionTest(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(output).all())
         self.assertEqual(output[..., 1, :].abs().max().item(), 0.0)
+
+    def test_tensor_mask_dispatches_to_dense_attention(self):
+        torch.manual_seed(1)
+        query = torch.randn(1, 2, 4, 4)
+        key = torch.randn(1, 2, 8, 4)
+        value = torch.randn(1, 2, 8, 3)
+        anchors = torch.tensor([[1, 3]])
+        keep = torch.ones_like(anchors, dtype=torch.bool)
+        mask = create_dflash_sdpa_mask(
+            anchors,
+            keep,
+            S=4,
+            block_size=2,
+            device=anchors.device,
+            context_window=2,
+            include_anchor_context=False,
+        )
+        host = _dispatch_host(self.attention_cls, scaling=0.5, block_size=2, value_dim=3)
+        expected = self.attention_cls._dense_attention(
+            host,
+            query,
+            key,
+            value,
+            mask,
+        )
+        output = self.attention_cls._attention(
+            host,
+            query,
+            key,
+            value,
+            mask,
+        )
+        torch.testing.assert_close(output, expected)
+
+    def test_unknown_mask_mentions_eager_backend(self):
+        host = _dispatch_host(self.attention_cls, scaling=0.5, block_size=2, value_dim=3)
+        query = torch.randn(1, 2, 4, 4)
+        key = torch.randn(1, 2, 8, 4)
+        value = torch.randn(1, 2, 8, 3)
+        with self.assertRaisesRegex(ValueError, "eager"):
+            self.attention_cls._attention(
+                host,
+                query,
+                key,
+                value,
+                object(),
+            )
+
+
+class Glm52DSparkAttentionWithoutFlexTest(unittest.TestCase):
+    _ATTENTION_MODULE = "specforge.modeling.draft.glm52_dspark_attention"
+    _FLEX_MODULE = "specforge.modeling.draft.flex_attention"
+
+    def test_module_loads_and_dense_dispatch_without_flex(self):
+        saved = {
+            name: sys.modules[name]
+            for name in (self._ATTENTION_MODULE, self._FLEX_MODULE)
+            if name in sys.modules
+        }
+        try:
+            sys.modules.pop(self._ATTENTION_MODULE, None)
+            with mock.patch.dict(sys.modules, {self._FLEX_MODULE: None}):
+                module = importlib.import_module(self._ATTENTION_MODULE)
+
+            self.assertIsNone(module.BlockMask)
+            self.assertIsNone(module.compile_friendly_flex_attention)
+
+            torch.manual_seed(2)
+            query = torch.randn(1, 2, 4, 4)
+            key = torch.randn(1, 2, 8, 4)
+            value = torch.randn(1, 2, 8, 3)
+            anchors = torch.tensor([[1, 3]])
+            keep = torch.ones_like(anchors, dtype=torch.bool)
+            mask = create_dflash_sdpa_mask(
+                anchors,
+                keep,
+                S=4,
+                block_size=2,
+                device=anchors.device,
+                context_window=2,
+                include_anchor_context=False,
+            )
+            host = _dispatch_host(
+                module.Glm52DSparkAttention,
+                scaling=0.5,
+                block_size=2,
+                value_dim=3,
+            )
+            expected = module.Glm52DSparkAttention._dense_attention(
+                host,
+                query,
+                key,
+                value,
+                mask,
+            )
+            output = module.Glm52DSparkAttention._attention(
+                host,
+                query,
+                key,
+                value,
+                mask,
+            )
+            torch.testing.assert_close(output, expected)
+            with self.assertRaisesRegex(ValueError, "eager"):
+                module.Glm52DSparkAttention._attention(
+                    host,
+                    query,
+                    key,
+                    value,
+                    object(),
+                )
+        finally:
+            sys.modules.pop(self._ATTENTION_MODULE, None)
+            if self._FLEX_MODULE in saved:
+                sys.modules[self._FLEX_MODULE] = saved[self._FLEX_MODULE]
+            if self._ATTENTION_MODULE in saved:
+                sys.modules[self._ATTENTION_MODULE] = saved[self._ATTENTION_MODULE]
+            else:
+                importlib.import_module(self._ATTENTION_MODULE)
 
 
 class Glm52DSparkModelTest(unittest.TestCase):
