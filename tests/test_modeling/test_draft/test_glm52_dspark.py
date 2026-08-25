@@ -137,7 +137,7 @@ class Glm52DSparkAttentionTest(unittest.TestCase):
             block_size=block_size,
             device=anchors.device,
             context_window=2,
-            include_anchor_context=True,
+            include_anchor_context=False,
         )
         fake = _FakeAttention(
             scaling=key_dim**-0.5,
@@ -170,7 +170,7 @@ class Glm52DSparkAttentionTest(unittest.TestCase):
             block_size=2,
             device=anchors.device,
             context_window=2,
-            include_anchor_context=True,
+            include_anchor_context=False,
         )
         mask[..., 1, :] = False
         fake = _FakeAttention(
@@ -210,8 +210,9 @@ class Glm52DSparkModelTest(unittest.TestCase):
             context_window=model.context_window,
             include_anchor_context=model.include_anchor_context,
         )
-        self.assertFalse(windowed[0, 0, 0, :3].any())
-        self.assertTrue(windowed[0, 0, 0, 3:5].all())
+        self.assertFalse(windowed[0, 0, 0, :2].any())
+        self.assertTrue(windowed[0, 0, 0, 2:4].all())
+        self.assertFalse(bool(windowed[0, 0, 0, 4]))
 
     def test_every_stage_uses_dense_mlp(self):
         model = self.model_cls(_tiny_config())
@@ -255,7 +256,7 @@ class Glm52DSparkModelTest(unittest.TestCase):
             block_size=2,
             device=anchors.device,
             context_window=model.context_window,
-            include_anchor_context=True,
+            include_anchor_context=model.include_anchor_context,
         )
         position_ids = torch.tensor([[0, 1, 2, 3, 1, 2, 3, 4]])
 
