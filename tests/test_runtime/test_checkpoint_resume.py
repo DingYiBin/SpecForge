@@ -163,6 +163,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         feat_dir,
         max_steps,
         resume_from=None,
+        resume_reset_data_position=False,
         run_id="rz",
         seen=None,
         model=None,
@@ -171,6 +172,7 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         spec_name="eagle3",
         max_grad_norm=1.0,
         total_steps=100,
+        dataset_size=None,
     ):
         from specforge.optimizer import BF16Optimizer
         from specforge.runtime.control_plane import DataFlowController
@@ -213,6 +215,8 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 collate_fn=_x_collate,
                 per_sample_transform=_x_transform,
                 resume_from=resume_from,
+                resume_reset_data_position=resume_reset_data_position,
+                dataset_size=dataset_size,
                 checkpoint_extra=checkpoint_extra,
                 strategy_kwargs=strategy_kwargs,
             )
@@ -288,6 +292,101 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
         self.assertEqual(t3.fit(), 2)
         self.assertEqual(seen3, [])
         self.assertTrue(torch.equal(model3.draft_model.w.detach(), w_cut))
+
+    def test_resume_reset_data_position_allows_a_new_dump(self):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_reset_data_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        out = os.path.join(workdir, "out")
+        t1, _model1, _seen1 = self._make_trainer(
+            out,
+            feat_dir=feat_dir,
+            max_steps=2,
+            dataset_size=8,
+            checkpoint_extra={"source_dataset_size": 8},
+        )
+        self.assertEqual(t1.fit(), 2)
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+        masters_cut = [
+            tensor.detach().cpu().clone()
+            for tensor in t1.backend.optimizer.fp32_params
+        ]
+        scheduler_epoch = t1.backend.optimizer.scheduler.after_scheduler.last_epoch
+
+        smaller = _write_feature_files(os.path.join(workdir, "shard2"), n=4)
+        t2, _model2, seen2 = self._make_trainer(
+            os.path.join(workdir, "resume"),
+            feat_dir=smaller,
+            max_steps=4,
+            resume_from=checkpoint_uri,
+            resume_reset_data_position=True,
+            dataset_size=4,
+            checkpoint_extra={"source_dataset_size": 4},
+        )
+        ctrl = t2._controller
+        self.assertEqual(
+            (ctrl.global_step, ctrl._epoch_batch, ctrl._epoch_samples),
+            (2, 0, 0),
+        )
+        for restored, saved in zip(t2.backend.optimizer.fp32_params, masters_cut):
+            self.assertTrue(torch.equal(restored.detach().cpu(), saved))
+        self.assertEqual(
+            t2.backend.optimizer.scheduler.after_scheduler.last_epoch,
+            scheduler_epoch,
+        )
+        self.assertEqual(t2.fit(), 4)
+        self.assertEqual(
+            seen2,
+            ["data:00000000", "data:00000001", "data:00000002", "data:00000003"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "dataset_size="):
+            self._make_trainer(
+                os.path.join(workdir, "mismatch"),
+                feat_dir=smaller,
+                max_steps=4,
+                resume_from=checkpoint_uri,
+                dataset_size=4,
+                checkpoint_extra={"source_dataset_size": 8},
+            )
+
+    def test_resume_reset_data_position_restarts_epoch_on_a_completed_shard(
+        self,
+    ):
+        workdir = tempfile.mkdtemp(prefix="trainer_resume_reset_epoch_")
+        feat_dir = _write_feature_files(os.path.join(workdir, "features"), n=8)
+        out = os.path.join(workdir, "out")
+        t1, _model1, _seen1 = self._make_trainer(
+            out,
+            feat_dir=feat_dir,
+            max_steps=4,
+            dataset_size=8,
+            checkpoint_extra={"source_dataset_size": 8},
+        )
+        self.assertEqual(t1.fit(), 4)
+        self.assertEqual(t1._controller.epoch, 1)
+        checkpoint_uri = f"file://{os.path.realpath(os.path.join(out, 'rz-latest'))}"
+
+        smaller = _write_feature_files(os.path.join(workdir, "shard2"), n=4)
+        t2, _model2, seen2 = self._make_trainer(
+            os.path.join(workdir, "resume"),
+            feat_dir=smaller,
+            max_steps=6,
+            resume_from=checkpoint_uri,
+            resume_reset_data_position=True,
+            dataset_size=4,
+            checkpoint_extra={"source_dataset_size": 4},
+        )
+        ctrl = t2._controller
+        self.assertEqual(ctrl.epoch, 0)
+        self.assertEqual(
+            (ctrl.global_step, ctrl._epoch_batch, ctrl._epoch_samples),
+            (4, 0, 0),
+        )
+        self.assertEqual(t2.fit(), 6)
+        self.assertEqual(
+            seen2,
+            ["data:00000000", "data:00000001", "data:00000002", "data:00000003"],
+        )
 
     def test_resume_validation_fails_fast(self):
         workdir = tempfile.mkdtemp(prefix="trainer_resume_bad_")

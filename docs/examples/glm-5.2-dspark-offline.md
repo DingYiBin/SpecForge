@@ -102,3 +102,11 @@ Resume validation rejects changes to the draft block size, stage count, fixed
 SWA window, dense-MLP mode, mask token, target layers, or objective semantics.
 HF draft warm-start, checkpoint merging, and serving export are outside this
 recipe's scope.
+
+To keep optimizer state and the cosine schedule after deleting a dump and
+pointing `data.hidden_states_path` at the next shard, add
+`training.resume_reset_data_position=true` with the same `resume_from`. Keep
+`max_steps` / `total_steps`, batch size, and DSpark loss coefficients unchanged.
+The new shard is read from epoch 0 / sample 0; `dataset_size` may differ.
+A completed ``num_epochs=1`` shard still continues because the epoch counter
+is reset with the data cursor.

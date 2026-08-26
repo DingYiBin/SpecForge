@@ -285,6 +285,27 @@ class ConfigSchemaTest(unittest.TestCase):
         )
         self.assertEqual(local.training.resume_from, "/checkpoints/run-latest")
 
+        with self.assertRaisesRegex(
+            ValueError, "resume_reset_data_position requires training.resume_from"
+        ):
+            Config.model_validate(
+                {
+                    **MINIMAL,
+                    "training": {"resume_reset_data_position": True},
+                }
+            )
+
+        reset = Config.model_validate(
+            {
+                **MINIMAL,
+                "training": {
+                    "resume_from": "/checkpoints/run-latest",
+                    "resume_reset_data_position": True,
+                },
+            }
+        )
+        self.assertTrue(reset.training.resume_reset_data_position)
+
         consumer_payload = _online_payload("dflash")
         consumer_payload["training"].update(
             {

@@ -165,6 +165,7 @@ There are two deliberately separate checkpoint operations:
 | Intent | Config field | Restored state |
 | --- | --- | --- |
 | Continue the same run | `training.resume_from` | draft weights, optimizer/scheduler, epoch/step/data position, and per-rank RNG |
+| Continue optimizer on a new dump | `training.resume_from` plus `training.resume_reset_data_position` | draft weights, optimizer/scheduler, and `global_step`; epoch and data cursor reset to 0; `dataset_size` may change |
 | Initialize a new run from weights | `model.draft_checkpoint_path` | draft weights only |
 
 A weights-only warm start accepts a Hugging Face model directory/repository or

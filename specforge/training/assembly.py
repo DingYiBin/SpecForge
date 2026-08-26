@@ -514,6 +514,7 @@ def _common_launch_kwargs(
         activation_checkpointing=t.activation_checkpointing,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
+        resume_reset_data_position=t.resume_reset_data_position,
     )
 
 

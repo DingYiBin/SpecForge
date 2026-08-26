@@ -33,6 +33,8 @@ from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
 from specforge.training.controller import TrainerController, TrainerCore
 
+_DATA_SIZE_RESUME_KEYS = frozenset({"dataset_size", "source_dataset_size"})
+
 logger = logging.getLogger(__name__)
 
 
@@ -103,6 +105,7 @@ class Trainer:
         durable_ack: bool = True,
         resume_from: Optional[str] = None,
         resume_state: Optional[dict] = None,
+        resume_reset_data_position: bool = False,
         dataset_size: Optional[int] = None,
         checkpoint_extra: Optional[dict] = None,
         max_checkpoints: int = 0,
@@ -126,6 +129,10 @@ class Trainer:
             raise ValueError("deferred queue ack is valid only for a queue source")
         if defer_queue_ack and not durable_ack:
             raise ValueError("deferred queue ack requires durable_ack=True")
+        if resume_reset_data_position and not resume_from:
+            raise ValueError(
+                "resume_reset_data_position requires resume_from"
+            )
 
         # Fixed offline refs never enter an online staging queue. The loader
         # releases each feature as it consumes it and can re-iterate the same
@@ -299,6 +306,8 @@ class Trainer:
                 **persisted_contract,
             }
             for key, current in resume_contract.items():
+                if resume_reset_data_position and key in _DATA_SIZE_RESUME_KEYS:
+                    continue
                 persisted = state.get(key)
                 persisted_available = key in state
                 comparison_current = current
@@ -367,43 +376,52 @@ class Trainer:
                 raise ValueError(
                     f"checkpoint {resume_from} has negative epoch_samples={samples}"
                 )
-            if dataset_size is not None and samples > dataset_size:
-                raise ValueError(
-                    f"checkpoint {resume_from} stopped after {samples} samples, "
-                    f"past this run's dataset_size={dataset_size}"
-                )
             saved_epoch = int(state.get("epoch", 0))
             if not 0 <= saved_epoch <= num_epochs:
                 raise ValueError(
                     f"checkpoint {resume_from} has epoch={saved_epoch}, outside "
                     f"this run's [0, {num_epochs}] epoch range"
                 )
-            if saved_epoch == num_epochs and samples:
-                raise ValueError(
-                    f"checkpoint {resume_from} is complete at epoch={saved_epoch} "
-                    f"but still records epoch_samples={samples}"
-                )
-            if "refs" in ref_source or data_prepositioned:
-                if samples % batch_size:
+            if resume_reset_data_position:
+                # New dump: replay epoch 0 from sample 0. Keeping the saved
+                # epoch would no-op after a completed ``num_epochs=1`` shard.
+                start_batch = start_samples = 0
+                saved_epoch = 0
+            else:
+                if dataset_size is not None and samples > dataset_size:
                     raise ValueError(
-                        f"checkpoint {resume_from} stopped mid-epoch after "
-                        f"{samples} samples, which is not a whole number of "
-                        f"batches at batch_size={batch_size}; resume with the "
-                        f"batch size the checkpoint was written with"
+                        f"checkpoint {resume_from} stopped after {samples} samples, "
+                        f"past this run's dataset_size={dataset_size}"
                     )
-                start_batch, start_samples = samples // batch_size, samples
-                persisted_batch = state.get("epoch_batch")
-                if persisted_batch is not None and int(persisted_batch) != start_batch:
+                if saved_epoch == num_epochs and samples:
                     raise ValueError(
-                        f"checkpoint {resume_from} has epoch_batch="
-                        f"{persisted_batch} but epoch_samples={samples} implies "
-                        f"{start_batch} batches at batch_size={batch_size}"
+                        f"checkpoint {resume_from} is complete at epoch={saved_epoch} "
+                        f"but still records epoch_samples={samples}"
                     )
-            elif samples:
-                raise ValueError(
-                    f"checkpoint {resume_from} has a streamed mid-epoch position, "
-                    "but the queue was not rebuilt as prepositioned"
-                )
+                if "refs" in ref_source or data_prepositioned:
+                    if samples % batch_size:
+                        raise ValueError(
+                            f"checkpoint {resume_from} stopped mid-epoch after "
+                            f"{samples} samples, which is not a whole number of "
+                            f"batches at batch_size={batch_size}; resume with the "
+                            f"batch size the checkpoint was written with"
+                        )
+                    start_batch, start_samples = samples // batch_size, samples
+                    persisted_batch = state.get("epoch_batch")
+                    if (
+                        persisted_batch is not None
+                        and int(persisted_batch) != start_batch
+                    ):
+                        raise ValueError(
+                            f"checkpoint {resume_from} has epoch_batch="
+                            f"{persisted_batch} but epoch_samples={samples} implies "
+                            f"{start_batch} batches at batch_size={batch_size}"
+                        )
+                elif samples:
+                    raise ValueError(
+                        f"checkpoint {resume_from} has a streamed mid-epoch position, "
+                        "but the queue was not rebuilt as prepositioned"
+                    )
             resume = {
                 "backend": state["backend"],
                 "global_step": state["global_step"],

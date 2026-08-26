@@ -544,6 +544,11 @@ class TrainingConfig(StrictConfigModel):
     compact_teacher_chunk_size: Optional[int] = Field(default=None, gt=0)
     #: resume target: a checkpoint dir / file:// URI / run root.
     resume_from: Optional[str] = None
+    #: Keep optimizer/scheduler/global_step from ``resume_from``, but start the
+    #: new dump at epoch 0 / sample 0. Skips ``dataset_size`` /
+    #: ``source_dataset_size`` resume checks so a replacement shard can follow a
+    #: deleted offline dump. Requires ``resume_from``.
+    resume_reset_data_position: bool = False
     #: ``all`` is an offline colocated run. Online runs launch producer and
     #: consumer as separate ``specforge train`` processes with the same config
     #: and different roles.
@@ -575,6 +580,10 @@ class TrainingConfig(StrictConfigModel):
             raise ValueError(
                 "training.sp_ulysses_size/sp_ring_size require "
                 "training.attention_backend=usp"
+            )
+        if self.resume_reset_data_position and self.resume_from is None:
+            raise ValueError(
+                "training.resume_reset_data_position requires training.resume_from"
             )
         return self
 

@@ -465,6 +465,7 @@ def _build_offline(
         log_interval=cfg.training.log_interval,
         strategy_kwargs=bundle.strategy_kwargs,
         resume_from=cfg.training.resume_from,
+        resume_reset_data_position=cfg.training.resume_reset_data_position,
         max_checkpoints=cfg.training.max_checkpoints,
         tp_size=cfg.training.tp_size,
         sp_ulysses_size=cfg.training.sp_ulysses_size,
@@ -752,6 +753,7 @@ def _build_online(
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
         resume_from=cfg.training.resume_from,
+        resume_reset_data_position=cfg.training.resume_reset_data_position,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),
     )
