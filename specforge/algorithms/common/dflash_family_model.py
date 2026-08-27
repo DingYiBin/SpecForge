@@ -1446,6 +1446,15 @@ class OnlineDSparkModel(OnlineDFlashModel):
             )
             for position in range(self.block_size)
         }
+        position_metrics.update(
+            {
+                f"mtp_{position + 1}_minus_{position}_loss": (
+                    position_metrics[f"mtp_{position + 1}_loss"]
+                    - position_metrics[f"mtp_{position}_loss"]
+                )
+                for position in range(1, self.block_size)
+            }
+        )
         metrics = {
             "ce_loss": global_stats[1] / global_denominator,
             "l1_loss": global_stats[2] / global_denominator,
