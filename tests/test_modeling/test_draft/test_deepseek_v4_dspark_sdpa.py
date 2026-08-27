@@ -37,7 +37,7 @@ def _build_dflash_mask(B, N, bs, S, device):
     # anchors: spread across context
     anchors = torch.linspace(bs, S - 1, N, device=device).long().view(1, 1, N, 1)
     anchor_exp = anchors.repeat_interleave(bs, dim=2)  # (1,1,Q,1)
-    ctx = (kv_idx < S) & (kv_idx <= anchor_exp)
+    ctx = (kv_idx < S) & (kv_idx < anchor_exp)
     is_draft = kv_idx >= S
     kv_block = (kv_idx - S) // bs
     draft = is_draft & (q_block == kv_block)

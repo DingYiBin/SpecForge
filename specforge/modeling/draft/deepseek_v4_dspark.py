@@ -430,14 +430,12 @@ class DeepseekV4DSparkAttention(nn.Module):
     #
     # 2. The draft segment degenerates:
     #    - If ``block_size`` also collapses to 1 (one-token "blocks"), the
-    #      draft-draft region becomes a 1x1 self-attention per position. With
-    #      ``include_anchor_context=True`` each query already attends to
-    #      itself via the context, so the draft segment is fully redundant and
-    #      the whole split-softmax below can be removed -- attention reduces to
-    #      plain causal (± sliding_window) over the full sequence. That removes
-    #      BOTH the custom-mask problem and the Q != KV problem that forced us
-    #      off fused SDPA in the first place, enabling a single fused
-    #      causal/flash call (with sliding window if supported).
+    #      draft-draft region becomes a 1x1 self-attention per position. The
+    #      draft token supplies that position because target-derived context
+    #      remains strictly before the anchor. The split-softmax can then be
+    #      replaced by causal attention over context plus the draft token,
+    #      removing both the custom-mask problem and the Q != KV problem that
+    #      forced us off fused SDPA in the first place.
     #    - If ``block_size`` stays > 1, the block-diagonal structure is
     #      preserved so the split-softmax here remains valid and beneficial;
     #      but Q grows to R*block_size, so the context chunk loop is mandatory
@@ -998,9 +996,6 @@ class DeepseekV4DSparkDraftModel(DeepseekV4PreTrainedModel):
             raise ValueError("DeepSeek-V4 DSpark mask token id is missing")
         self.projector_type = "dspark"
         self.context_window = int(config.sliding_window)
-        # At inference, the sampled anchor has not passed through the target
-        # model yet, so its target-derived context KV is unavailable.
-        self.include_anchor_context = False
 
         num_stages = int(
             method_config.get(

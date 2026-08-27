@@ -242,10 +242,6 @@ class Glm52DSparkDraftModel(GlmMoeDsaPreTrainedModel):
 
         self.projector_type = "dspark"
         self.context_window = int(config.sliding_window)
-        # Match DeepSeek-V4 DSpark / vLLM propose: the query sits at
-        # last_pos+1, so target-derived KV is only available for tokens
-        # strictly before the anchor.
-        self.include_anchor_context = False
         num_stages = int(
             method_config.get(
                 "num_layers",

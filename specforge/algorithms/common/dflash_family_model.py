@@ -52,7 +52,6 @@ def create_dflash_sdpa_mask(
     block_size,
     device,
     context_window=None,
-    include_anchor_context=False,
 ):
     B, N = anchor_positions.shape
     Q_LEN = N * block_size
@@ -69,16 +68,9 @@ def create_dflash_sdpa_mask(
         block_size, dim=2
     )
 
-    context_bound = (
-        kv_indices <= anchor_expanded
-        if include_anchor_context
-        else kv_indices < anchor_expanded
-    )
-    mask_context = (kv_indices < S) & context_bound
+    mask_context = (kv_indices < S) & (kv_indices < anchor_expanded)
     if context_window is not None:
         first_context = anchor_expanded - int(context_window)
-        if include_anchor_context:
-            first_context = first_context + 1
         mask_context = mask_context & (kv_indices >= first_context)
 
     is_draft = kv_indices >= S
@@ -98,7 +90,6 @@ def create_dflash_block_mask(
     block_size: int,
     device: torch.device,
     context_window: Optional[int] = None,
-    include_anchor_context: bool = False,
 ):
     """Construct Flex Attention BlockMask for DFlash training.
 
@@ -106,8 +97,7 @@ def create_dflash_block_mask(
     Q:  [Block_0 | Block_1 | ... | Block_{n-1}]
 
     Rules:
-      1. Each block sees the configured context window before its anchor; models
-         may additionally include the anchor position.
+      1. Each block sees the configured context window strictly before its anchor.
       2. Intra-block attention is bidirectional.
       3. Different blocks are invisible to each other.
       4. Invalid blocks (block_keep_mask=False) see nothing.
@@ -119,14 +109,9 @@ def create_dflash_block_mask(
         anchor_pos = anchor_positions[b, safe_q_block_id]
 
         is_context = kv_idx < S
-        context_bound = (
-            kv_idx <= anchor_pos if include_anchor_context else kv_idx < anchor_pos
-        )
-        mask_context = is_context & context_bound
+        mask_context = is_context & (kv_idx < anchor_pos)
         if context_window is not None:
             first_context = anchor_pos - int(context_window)
-            if include_anchor_context:
-                first_context = first_context + 1
             mask_context = mask_context & (kv_idx >= first_context)
 
         is_draft = kv_idx >= S
@@ -327,9 +312,6 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
-                include_anchor_context=getattr(
-                    self.draft_model, "include_anchor_context", False
-                ),
             )
         else:
             dflash_attn_mask = create_dflash_sdpa_mask(
@@ -339,9 +321,6 @@ class OnlineDFlashModel(nn.Module):
                 block_size=self.block_size,
                 device=device,
                 context_window=getattr(self.draft_model, "context_window", None),
-                include_anchor_context=getattr(
-                    self.draft_model, "include_anchor_context", False
-                ),
             )
 
         output_hidden = self.draft_model(
