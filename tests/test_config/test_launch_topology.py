@@ -11,6 +11,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_CONFIG_DIR = REPO_ROOT / "examples" / "configs"
 
 EXPECTED_NPROC_PER_NODE = {
+    "deepseek-v4-flash-dspark-offline-npu.yaml": 8,
+    "deepseek-v4-flash-dspark-offline-smoke.yaml": 8,
+    "glm-5.2-dspark-offline-npu.yaml": 8,
+    "glm-5.2-dspark-offline-smoke.yaml": 8,
+    "glm-5.2-dspark-windowed-online-npu.yaml": 8,
     "deepseek-v2-lite-eagle3-online.yaml": 8,
     "deepseek-v3-671b-eagle3-offline.yaml": 8,
     "deepseek-v3-671b-eagle3-online.yaml": 8,
@@ -37,6 +42,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3-32b-eagle3-online.yaml": 4,
     "qwen3-4b-dflash-online.yaml": 8,
     "qwen3-4b-dspark-disaggregated.yaml": 1,
+    "qwen3-4b-dspark-deepspec-offline.yaml": 4,
     "qwen3-4b-eagle3-online.yaml": 1,
     "qwen3-8b-dflash-disaggregated.yaml": 4,
     "qwen3-8b-dflash-1server-dp7-disaggregated.yaml": 7,
@@ -66,6 +72,7 @@ EXPECTED_NPROC_PER_NODE = {
     "qwen3.6-27b-dflash-multiserver-disaggregated.yaml": 2,
     "qwen3.6-27b-dflash-online.yaml": 8,
     "qwen3.6-27b-domino-online.yaml": 8,
+    "qwen3.8-flash-next-dspark-offline.yaml": 4,
     "qwq-32b-eagle3-online.yaml": 4,
 }
 
@@ -76,6 +83,17 @@ LOCAL_MOONCAKE_ENDPOINTS = {
 }
 
 EXPECTED_DISAGGREGATED = {
+    "glm-5.2-dspark-windowed-online-npu.yaml": {
+        "control_dir": "outputs/glm-5.2-dspark-windowed-online-npu/control",
+        "consumer_state_dir": (
+            "outputs/glm-5.2-dspark-windowed-online-npu/consumer-state"
+        ),
+        "backend": "mooncake",
+        "producer_segment_size": 6442450944,
+        "client_buffer_size": 1073741824,
+        "server_urls": ["http://127.0.0.1:30000"],
+        **LOCAL_MOONCAKE_ENDPOINTS,
+    },
     "qwen2.5-7b-eagle3-offline-disaggregated.yaml": {
         "control_dir": ("outputs/qwen2.5-7b-eagle3-offline-disaggregated/control"),
         "backend": "shared_dir",
@@ -267,7 +285,7 @@ def _recipes() -> dict[str, Path]:
 class ExampleLaunchTopologyTest(unittest.TestCase):
     def test_every_recipe_has_the_explicit_golden_topology(self):
         recipes = _recipes()
-        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 56)
+        self.assertEqual(len(EXPECTED_NPROC_PER_NODE), 63)
         self.assertEqual(set(recipes), set(EXPECTED_NPROC_PER_NODE))
 
         for filename, nproc_per_node in EXPECTED_NPROC_PER_NODE.items():
@@ -284,7 +302,11 @@ class ExampleLaunchTopologyTest(unittest.TestCase):
 
                 deployment = payload["deployment"]
                 data = payload["data"]
-                online = bool(data.get("train_data_path") or data.get("prompts_path"))
+                online = bool(
+                    data.get("train_data_path")
+                    or data.get("prompts_path")
+                    or data.get("parent_bin_path")
+                )
                 expected_mode = (
                     "disaggregated"
                     if online or filename in EXPECTED_DISAGGREGATED

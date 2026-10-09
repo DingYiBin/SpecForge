@@ -16,6 +16,7 @@ from specforge.config import (
     TrackingConfig,
     TrainerDeploymentConfig,
     TrainingConfig,
+    WindowedOnlineConfig,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -28,6 +29,7 @@ def test_recipe_readme_names_every_typed_config_field():
         ("", Config),
         ("model", ModelConfig),
         ("data", DataConfig),
+        ("data.windowed_online", WindowedOnlineConfig),
         ("training", TrainingConfig),
         ("tracking", TrackingConfig),
         ("profiling", ProfilingConfig),

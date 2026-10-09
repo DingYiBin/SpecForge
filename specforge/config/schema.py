@@ -109,6 +109,32 @@ class ModelConfig(StrictConfigModel):
         return self
 
 
+class WindowedOnlineConfig(StrictConfigModel):
+    """One long capture parent fanned out into overlapping training windows."""
+
+    child_length: int = Field(default=1024, gt=1)
+    overlap: int = Field(default=128, ge=0)
+    children_per_parent: int = Field(default=48, gt=0)
+    shuffle_parents: bool = True
+    wrap_around: Literal[True] = True
+
+    @model_validator(mode="after")
+    def _validate_geometry(self):
+        if self.overlap >= self.child_length:
+            raise ValueError(
+                "data.windowed_online.overlap must be smaller than child_length"
+            )
+        return self
+
+    @property
+    def stride(self) -> int:
+        return self.child_length - self.overlap
+
+    @property
+    def parent_length(self) -> int:
+        return self.child_length + (self.children_per_parent - 1) * self.stride
+
+
 class DataConfig(StrictConfigModel):
     #: online mode — raw conversation JSON/JSONL.
     train_data_path: str = ""
@@ -116,6 +142,9 @@ class DataConfig(StrictConfigModel):
     prompts_path: str = ""
     #: offline mode — directory of precomputed hidden-state .ckpt files.
     hidden_states_path: str = ""
+    #: Online DSpark mode — one flat little-endian int32 token ring.
+    parent_bin_path: str = ""
+    windowed_online: Optional[WindowedOnlineConfig] = None
     #: Reserved migration field. Online evaluation is unsupported; keep empty.
     eval_data_path: str = ""
     #: offline evaluation — directory of precomputed hidden-state .ckpt files.
@@ -142,12 +171,27 @@ class DataConfig(StrictConfigModel):
             bool(self.train_data_path),
             bool(self.prompts_path),
             bool(self.hidden_states_path),
+            bool(self.parent_bin_path),
         ]
         if sum(sources) != 1:
             raise ValueError(
                 "set exactly one of data.train_data_path (raw online data), "
                 "data.prompts_path (pre-tokenized online data), or "
-                "data.hidden_states_path (offline features)"
+                "data.hidden_states_path (offline features), or "
+                "data.parent_bin_path (windowed online int32 tokens)"
+            )
+        if bool(self.parent_bin_path) != (self.windowed_online is not None):
+            raise ValueError(
+                "data.parent_bin_path and data.windowed_online must be configured "
+                "together"
+            )
+        if (
+            self.windowed_online is not None
+            and self.max_length != self.windowed_online.child_length
+        ):
+            raise ValueError(
+                "data.max_length must equal "
+                "data.windowed_online.child_length for child training samples"
             )
         return self
 
@@ -690,6 +734,50 @@ class Config(StrictConfigModel):
         deployment = self.deployment.mode
         role = self.training.role
 
+        windowed = self.data.windowed_online
+        if windowed is not None:
+            if self.training.strategy != "dspark":
+                raise ValueError(
+                    "data.windowed_online currently supports training.strategy=dspark"
+                )
+            if self.runtime.producer_lease != 1:
+                raise ValueError(
+                    "data.windowed_online requires runtime.producer_lease=1 so "
+                    "only one parent is captured per worker lease"
+                )
+            world_size = (
+                self.deployment.trainer.nnodes
+                * self.deployment.trainer.nproc_per_node
+            )
+            quantum = (
+                world_size
+                * self.training.batch_size
+                * self.training.accumulation_steps
+            )
+            children = windowed.children_per_parent
+            if self.runtime.in_flight_high_watermark < children:
+                raise ValueError(
+                    "data.windowed_online publishes one atomic parent group of "
+                    f"{children} children, so runtime.in_flight_high_watermark "
+                    f"must be at least {children}"
+                )
+            boundaries = {
+                "training.save_interval": self.training.save_interval,
+                "training.max_steps": self.training.max_steps,
+                "training.total_steps": self.training.total_steps,
+            }
+            misaligned = [
+                name
+                for name, steps in boundaries.items()
+                if steps not in (None, 0) and int(steps) * quantum % children
+            ]
+            if misaligned:
+                raise ValueError(
+                    "windowed online checkpoints/final steps must consume whole "
+                    f"parent groups of {children} children; quantum={quantum}, "
+                    f"misaligned={misaligned}"
+                )
+
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(
                 "online training requires deployment.mode=disaggregated; "
@@ -768,6 +856,11 @@ class Config(StrictConfigModel):
             if self.deployment.disaggregated is not None
             else None
         )
+        if windowed is not None and managed_local is not None:
+            raise ValueError(
+                "data.windowed_online currently requires an externally managed "
+                "capture server and Mooncake deployment"
+            )
         consumer_state_dir = (
             self.deployment.disaggregated.consumer_state_dir
             if self.deployment.disaggregated is not None
@@ -850,8 +943,15 @@ class Config(StrictConfigModel):
                     "divide every managed capture-server tp_size; incompatible "
                     f"tp sizes: {incompatible_tp_sizes}"
                 )
-        if self.training.role == "producer" and self.training.resume_from is not None:
-            raise ValueError("training.resume_from is valid only for a trainer role")
+        if (
+            self.training.role == "producer"
+            and self.training.resume_from is not None
+            and self.data.windowed_online is None
+        ):
+            raise ValueError(
+                "training.resume_from is valid only for a trainer role, except "
+                "for parent-aligned data-cursor resume in windowed online mode"
+            )
         if self.training.attention_backend == "usp":
             if mode != "offline":
                 raise ValueError("USP attention currently requires offline features")

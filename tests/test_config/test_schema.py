@@ -76,6 +76,56 @@ def _write(payload: dict, suffix: str) -> str:
 
 
 class ConfigSchemaTest(unittest.TestCase):
+    def test_windowed_online_source_and_parent_checkpoint_alignment(self):
+        payload = _online_payload("dspark")
+        payload["data"] = {
+            "parent_bin_path": "/tokens.bin",
+            "max_length": 1024,
+            "windowed_online": {
+                "child_length": 1024,
+                "overlap": 128,
+                "children_per_parent": 48,
+            },
+        }
+        payload["runtime"] = {"producer_lease": 1}
+        payload["deployment"]["trainer"] = {"nproc_per_node": 8}
+        payload["training"].update(
+            batch_size=1,
+            accumulation_steps=1,
+            save_interval=6,
+            max_steps=12,
+        )
+        cfg = Config.model_validate(payload)
+        self.assertEqual(cfg.data.windowed_online.parent_length, 43136)
+        self.assertEqual(cfg.data.windowed_online.stride, 896)
+
+        payload["runtime"].update(
+            in_flight_high_watermark=47,
+            in_flight_low_watermark=0,
+        )
+        with self.assertRaisesRegex(ValidationError, "atomic parent group"):
+            Config.model_validate(payload)
+        payload["runtime"]["in_flight_high_watermark"] = 48
+
+        payload["training"]["save_interval"] = 5
+        with self.assertRaisesRegex(ValidationError, "whole parent groups"):
+            Config.model_validate(payload)
+
+    def test_windowed_online_requires_dspark_and_matching_max_length(self):
+        payload = _online_payload("eagle3")
+        payload["data"] = {
+            "parent_bin_path": "/tokens.bin",
+            "max_length": 512,
+            "windowed_online": {"child_length": 1024},
+        }
+        payload["runtime"] = {"producer_lease": 1}
+        with self.assertRaisesRegex(ValidationError, "max_length"):
+            Config.model_validate(payload)
+
+        payload["data"]["max_length"] = 1024
+        with self.assertRaisesRegex(ValidationError, "strategy=dspark"):
+            Config.model_validate(payload)
+
     def test_offline_shuffle_is_typed_and_defaults_on(self):
         default = Config.model_validate(copy.deepcopy(MINIMAL))
         self.assertTrue(default.data.offline_shuffle)

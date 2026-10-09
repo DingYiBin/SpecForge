@@ -101,6 +101,14 @@ class SampleRef:
 
 
 @dataclass(frozen=True)
+class SampleRefGroup:
+    """All training samples atomically derived from one prompt task."""
+
+    task_id: str
+    refs: Tuple[SampleRef, ...]
+
+
+@dataclass(frozen=True)
 class FeatureHandle:
     """Lifetime token returned by ``FeatureStore.get``.
 
@@ -202,6 +210,7 @@ __all__ = [
     "PromptTask",
     "FeatureSpec",
     "SampleRef",
+    "SampleRefGroup",
     "FeatureHandle",
     "TrainBatch",
     "assert_no_tensors",

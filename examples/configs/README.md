@@ -139,10 +139,13 @@ should make their training strategy and topology explicit.
 | `model.draft_checkpoint_path` | `null` | Weights-only warm start for a new run. Do not combine it with `training.resume_from`. |
 | `model.draft_num_hidden_layers` | `null` | Positive fresh-architecture override where the strategy permits it. EAGLE3 remains one layer; P-EAGLE and DFlash may override their generated defaults. |
 | `model.draft_block_size` | `null` | Positive DFlash block-size override; generated DFlash configs default to 16. |
+| `model.moe_train_group_size` | `null` | Positive routed-expert group size for DSpark MoE FSDP wrapping. |
+| `model.attention_chunk_size` | `null` | Positive dense-attention query chunk size; lower it to reduce GLM/DeepSeek DSpark activation peaks. |
 | `model.target_backend` | `sglang` | `sglang` is the only accepted value; retired `hf`/`custom` names fail at config load. Offline feature consumers do not instantiate a target inference backend. |
 | `model.input_modality` | `text` | The provider modality. The unified runtime supports text only; VLM modalities such as `qwen2_5_vl` are rejected. |
 | `model.shard_target_output` | `false` | Retained for config migration; leave it false on the server-only online path. |
 | `model.trust_remote_code` | `false` | Enable only for model repositories that require custom loading code. |
+| `model.use_liger_kernel` | `false` | Enable supported Liger kernels; install the `liger` optional dependency first. |
 | `model.embedding_key` | `model.embed_tokens.weight` | Target checkpoint key copied into or used by the draft embedding. |
 | `model.lm_head_key` | `lm_head.weight` | Target checkpoint key used for the frozen output head. |
 | `model.vocab_mapping_path` | `""` | Target-to-draft vocabulary mapping. EAGLE3 disaggregated runs require an explicit shared file. |
@@ -165,13 +168,15 @@ should make their training strategy and topology explicit.
 
 ### `data`: choose exactly one training source
 
-Exactly one of the first three fields must be non-empty:
+Exactly one of the four training-source fields must be non-empty:
 
 | Field | Default | What to write |
 | --- | --- | --- |
 | `data.train_data_path` | `""` | Raw conversation/preformatted JSON or JSONL sent to the online capture producer. |
 | `data.prompts_path` | `""` | Pre-tokenized online JSONL with `input_ids` and `loss_mask`. |
 | `data.hidden_states_path` | `""` | Directory of precomputed offline feature `.ckpt` files. Selecting it makes the run offline. |
+| `data.parent_bin_path` | `""` | Flat little-endian int32 token ring for DSpark windowed online capture. Configure it together with `data.windowed_online`. |
+| `data.windowed_online` | `null` | Parent-to-child capture geometry. The initial implementation supports one external capture server and one parent lease. |
 | `data.eval_data_path` | `""` | Reserved migration field. Online evaluation is unsupported; leave it empty. |
 | `data.eval_hidden_states_path` | `""` | Offline evaluation features; configure them together with a positive `training.eval_interval`. |
 | `data.max_length` | `2048` | Maximum token length used by preparation, capture, and training. |
@@ -180,9 +185,18 @@ Exactly one of the first three fields must be non-empty:
 | `data.train_only_last_turn` | `false` | Restrict the loss mask to the final assistant turn. |
 | `data.build_dataset_num_proc` | `8` | Positive CPU process count for dataset preprocessing. |
 | `data.dataloader_num_workers` | `null` | Ordered feature-loader workers. `null` preserves strategy defaults: EAGLE/P-EAGLE 4, DFlash-family 8; use 0 for synchronous loading. |
+| `data.offline_shuffle` | `true` | Shuffle fixed offline refs deterministically for each epoch. |
+| `data.dspark_supervision` | `response` | Offline DSpark supervision policy: `response` or `full_sequence`. |
 | `data.cache_dir` | `./cache` | Prepared dataset and derived vocabulary-mapping cache. |
 | `data.cache_key` | `null` | Optional explicit namespace when multiple preparations share the same source. |
 | `data.max_prompts` | `null` | Optional non-negative prompt cap, useful for smoke tests. |
+
+`data.windowed_online` accepts `data.windowed_online.child_length` (1024),
+`data.windowed_online.overlap` (128),
+`data.windowed_online.children_per_parent` (48),
+`data.windowed_online.shuffle_parents` (true), and
+`data.windowed_online.wrap_around` (currently always true). Parent length is derived as
+`child_length + (children_per_parent - 1) * (child_length - overlap)`.
 
 Offline evaluation uses `eval_hidden_states_path`; configure it together with
 `training.eval_interval`. Online evaluation is unsupported, and setting
@@ -200,6 +214,7 @@ Common fields:
 | `training.total_steps` | `null` | Positive optimizer/loss schedule horizon; it does not itself stop an online stream. A finite online disaggregated run may omit both fields: the producer publishes the exact horizon derived from prepared prompts, epochs, DP size, batch size, and accumulation. |
 | `training.batch_size` | `1` | Per-rank microbatch size. P-EAGLE and USP require 1. |
 | `training.accumulation_steps` | `1` | Positive microbatches per optimizer update. |
+| `training.fsdp_sharding` | `SHARD_GRAD_OP` | FSDP strategy: `SHARD_GRAD_OP`, `FULL_SHARD`, or `NO_SHARD`. |
 | `training.learning_rate` | `1e-4` | Positive peak learning rate. |
 | `training.warmup_ratio` | `0.015` | Fraction in `[0, 1]` used for scheduler warmup. |
 | `training.max_grad_norm` | `0.5` | Positive gradient-clipping norm. |
@@ -225,8 +240,15 @@ Strategy-specific fields should be written only when tuning that objective:
 | --- | --- |
 | EAGLE3 | `training.ttt_length` (`7`), `training.lk_loss_type` (`null`; `lambda` or `alpha`), `training.kl_scale` (`1.0`), `training.kl_decay` (`1.0`) |
 | DFlash / Domino / D-PACE | `training.num_anchors` (`512`), `training.loss_decay_gamma` (`null`), `training.loss_type` (`dflash`), `training.dpace_alpha` (`0.5`), `training.lambda_base_start` (`1.0`), `training.lambda_base_decay_ratio` (`0.5`) |
-| DSpark | `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), `training.dspark_confidence_head_alpha` (`1.0`) |
+| DSpark | `training.dspark_loss_mode` (`original` or `kl`), `training.dspark_ce_loss_alpha` (`0.1`), `training.dspark_l1_loss_alpha` (`0.9`), `training.dspark_kl_loss_alpha` (`1.0`), `training.dspark_confidence_head_alpha` (`1.0`) |
 | P-EAGLE | `training.num_depths` (`8`), `training.down_sample_ratio` (`0.8`), `training.down_sample_ratio_min` (`0.2`), `training.norm_before_residual` (`null`) |
+
+Additional DSpark OPD controls are `training.dspark_opd_loss_alpha`,
+`training.dspark_opd_forward_weight`, `training.dspark_opd_rejected_weight`,
+`training.dspark_opd_rejected_position_decay`,
+`training.dspark_opd_logprob_min_clamp`, and
+`training.dspark_opd_loss_max_clamp`. Memory controls are
+`training.recompute_loss` and `training.activation_checkpointing`.
 
 New recipes must not write the loader-only migration fields
 `training.deployment_mode`, `training.server_urls`, or

@@ -27,6 +27,7 @@ from specforge.config import Config
 
 _PRODUCER_CLAIM_SUFFIX = ".producer_claim"
 _ONLINE_SCHEDULE_SUFFIX = ".schedule.json"
+_ONLINE_DATA_SUFFIX = ".windowed-data.json"
 _ONLINE_CONTROL_SUFFIXES = (
     ".closed",
     ".consumed_count",
@@ -35,6 +36,7 @@ _ONLINE_CONTROL_SUFFIXES = (
     ".consumer_failed",
     ".consumer_quantum",
     _ONLINE_SCHEDULE_SUFFIX,
+    _ONLINE_DATA_SUFFIX,
 )
 _OFFLINE_CONTROL_SUFFIXES = (".done", ".consumed", ".failed", ".consumer_failed")
 
@@ -214,6 +216,14 @@ def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
         batch_size=cfg.training.batch_size,
         accumulation_steps=cfg.training.accumulation_steps,
     )
+    if cfg.data.windowed_online is not None:
+        quantum = dp_size * cfg.training.batch_size * cfg.training.accumulation_steps
+        children = cfg.data.windowed_online.children_per_parent
+        if total_steps * quantum % children:
+            raise ValueError(
+                "derived windowed online schedule stops inside a parent: "
+                f"total_steps={total_steps}, quantum={quantum}, children={children}"
+            )
     return {
         "version": 1,
         "total_steps": total_steps,
@@ -224,6 +234,81 @@ def _online_schedule_payload(cfg: Config, *, num_prompts: int) -> dict:
         "batch_size": cfg.training.batch_size,
         "accumulation_steps": cfg.training.accumulation_steps,
     }
+
+
+def _windowed_data_contract(cfg: Config, prompts) -> dict:
+    windowed = cfg.data.windowed_online
+    if windowed is None:
+        return {}
+    return {
+        "version": 1,
+        "dataset_fingerprint": str(prompts.fingerprint),
+        "parents_per_epoch": int(len(prompts)),
+        "child_length": windowed.child_length,
+        "overlap": windowed.overlap,
+        "stride": windowed.stride,
+        "children_per_parent": windowed.children_per_parent,
+        "parent_length": windowed.parent_length,
+        "shuffle_parents": windowed.shuffle_parents,
+        "shuffle_seed": cfg.training.seed,
+        "shuffle_algorithm": "numpy-pcg64-v1",
+        "wrap_around": True,
+    }
+
+
+def _read_windowed_data_contract(channel_path: str) -> dict:
+    path = channel_path + _ONLINE_DATA_SUFFIX
+    _wait_for(
+        path,
+        timeout_s=_optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT"),
+        failure_path=channel_path + ".failed",
+    )
+    try:
+        with open(path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid windowed data contract {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError(f"unsupported windowed data contract in {path}: {payload!r}")
+    return payload
+
+
+def _windowed_resume_parent(cfg: Config, prompts, resume_state: dict) -> int:
+    """Translate a trainer checkpoint boundary into the next parent cursor."""
+    contract = _windowed_data_contract(cfg, prompts)
+    persisted = resume_state.get("windowed_online_data")
+    if persisted is None:
+        raise ValueError(
+            "windowed producer resume checkpoint does not contain "
+            "windowed_online_data"
+        )
+    if persisted != contract:
+        raise ValueError(
+            "windowed producer resume dataset contract does not match the "
+            f"checkpoint: current={contract}, saved={persisted}"
+        )
+    trainer = cfg.deployment.trainer
+    quantum = (
+        trainer.nnodes
+        * trainer.nproc_per_node
+        * cfg.training.batch_size
+        * cfg.training.accumulation_steps
+    )
+    consumed_children = int(resume_state.get("global_step", 0)) * quantum
+    children = cfg.data.windowed_online.children_per_parent
+    if consumed_children % children:
+        raise ValueError(
+            "windowed producer checkpoint is not parent-aligned: "
+            f"consumed_children={consumed_children}, children={children}"
+        )
+    start_parent = consumed_children // children
+    available = len(prompts) * cfg.training.num_epochs
+    if start_parent > available:
+        raise ValueError(
+            f"checkpoint resumes at parent {start_parent}, past the configured "
+            f"plan of {available}"
+        )
+    return start_parent
 
 
 def _read_online_total_steps(cfg: Config, channel_path: str) -> int:
@@ -543,10 +628,14 @@ def _build_online(
         from specforge.training.model_loading import resolve_draft_config
 
         input_adapter = streaming.create_input_adapter(cfg)
-        input_tools = _load_input_tools(
-            cfg,
-            algorithm,
-            input_adapter=input_adapter,
+        input_tools = (
+            None
+            if cfg.data.parent_bin_path
+            else _load_input_tools(
+                cfg,
+                algorithm,
+                input_adapter=input_adapter,
+            )
         )
         draft_config = resolve_draft_config(
             cfg,
@@ -564,8 +653,31 @@ def _build_online(
                 input_tools,
                 draft_config=draft_config,
             )
+        start_parent = 0
+        if cfg.data.windowed_online is not None:
+            data_contract = _windowed_data_contract(cfg, prompts)
+            _write_control(
+                channel_path + _ONLINE_DATA_SUFFIX,
+                json.dumps(data_contract, sort_keys=True),
+            )
+            if cfg.training.resume_from is not None:
+                from specforge.training.checkpoint import CheckpointManager
+
+                resume_state = CheckpointManager.read_resume_state(
+                    cfg.training.resume_from
+                )
+                start_parent = _windowed_resume_parent(
+                    cfg, prompts, resume_state
+                )
         if cfg.training.total_steps is None and cfg.training.max_steps is None:
-            schedule = _online_schedule_payload(cfg, num_prompts=len(prompts))
+            sample_multiplier = (
+                cfg.data.windowed_online.children_per_parent
+                if cfg.data.windowed_online is not None
+                else 1
+            )
+            schedule = _online_schedule_payload(
+                cfg, num_prompts=len(prompts) * sample_multiplier
+            )
             _write_control(
                 channel_path + _ONLINE_SCHEDULE_SUFFIX,
                 json.dumps(schedule, sort_keys=True),
@@ -592,12 +704,42 @@ def _build_online(
             )
             for url in _server_urls(cfg)
         ]
+        if cfg.data.windowed_online is not None:
+            if len(adapters) != 1:
+                raise ValueError(
+                    "data.windowed_online currently requires exactly one capture "
+                    "server so parent publication remains strictly ordered"
+                )
+            from specforge.inference.adapters.windowed_capture import (
+                WindowedServerCaptureAdapter,
+            )
+
+            windowed = cfg.data.windowed_online
+            adapters = [
+                WindowedServerCaptureAdapter(
+                    adapters[0],
+                    store,
+                    child_length=windowed.child_length,
+                    overlap=windowed.overlap,
+                    children_per_parent=windowed.children_per_parent,
+                )
+            ]
         target_repr = streaming.target_representation
         peer_wait_timeout_s = _optional_timeout_s("DISAGG_PEER_WAIT_TIMEOUT")
         high_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_HIGH_WATERMARK")
         in_flight_high_watermark = int(
             high_watermark_override or cfg.runtime.in_flight_high_watermark
         )
+        if (
+            cfg.data.windowed_online is not None
+            and in_flight_high_watermark
+            < cfg.data.windowed_online.children_per_parent
+        ):
+            raise ValueError(
+                "windowed online in-flight high watermark must hold one atomic "
+                f"parent group of {cfg.data.windowed_online.children_per_parent} "
+                "children"
+            )
         low_watermark_override = os.environ.get("DISAGG_IN_FLIGHT_LOW_WATERMARK")
         # Preserve the legacy one-watermark environment override: when only the
         # old high value is supplied, resume at that same threshold.
@@ -643,6 +785,7 @@ def _build_online(
                 cfg.runtime.feature_store_max_resident_bytes
             ),
             peer_wait_timeout_s=peer_wait_timeout_s,
+            start_parent=start_parent,
         )
 
         def produce() -> int:
@@ -725,6 +868,9 @@ def _build_online(
 
     from specforge.launch import build_disagg_online_consumer
 
+    windowed_data_contract = None
+    if cfg.data.windowed_online is not None:
+        windowed_data_contract = _read_windowed_data_contract(channel_path)
     total_steps = cfg.training.total_steps
     if total_steps is None and cfg.training.max_steps is None:
         total_steps = _read_online_total_steps(cfg, channel_path)
@@ -755,6 +901,15 @@ def _build_online(
         sp_ring_size=cfg.training.sp_ring_size,
         inbox_dir=os.environ.get("DISAGG_INBOX_DIR") or None,
         resume_from=cfg.training.resume_from,
+        fresh_data_resume=(
+            cfg.data.windowed_online is not None
+            and cfg.training.resume_from is not None
+        ),
+        checkpoint_extra=(
+            {"windowed_online_data": windowed_data_contract}
+            if windowed_data_contract is not None
+            else None
+        ),
         resume_reset_data_position=cfg.training.resume_reset_data_position,
         dataloader_num_workers=_dataloader_num_workers(cfg, algorithm),
         profiling_options=_profiling_options(cfg),

@@ -377,6 +377,27 @@ def _prepare_prompts(
             f"algorithm {algorithm.name!r} must provide a ServerInputAdapter "
             f"for {cfg.model.input_modality!r}"
         )
+    if cfg.data.parent_bin_path:
+        from specforge.data.windowed_online import (
+            WindowGeometry,
+            WindowedParentPlan,
+        )
+
+        windowed = cfg.data.windowed_online
+        if windowed is None:  # guarded by DataConfig, retained for direct callers
+            raise ValueError("data.parent_bin_path requires data.windowed_online")
+        return WindowedParentPlan(
+            cfg.data.parent_bin_path,
+            geometry=WindowGeometry(
+                child_length=windowed.child_length,
+                overlap=windowed.overlap,
+                children_per_parent=windowed.children_per_parent,
+            ),
+            seed=cfg.training.seed,
+            shuffle=windowed.shuffle_parents,
+            max_parents=cfg.data.max_prompts,
+        )
+
     from specforge.data.prompt_builder import prepare_prompt_tasks
 
     configured_path = cfg.data.prompts_path or cfg.data.train_data_path

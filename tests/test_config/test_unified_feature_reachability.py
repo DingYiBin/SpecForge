@@ -128,12 +128,17 @@ EXPECTED_TRACKING = {
 }
 
 LEGACY_DIST_TIMEOUT_OVERRIDES = {
+    "deepseek-v4-flash-dspark-offline-smoke.yaml": 120,
     "deepseek-v3-671b-eagle3-online.yaml": 60,
+    "glm-5.2-dspark-offline-npu.yaml": 120,
+    "glm-5.2-dspark-offline-smoke.yaml": 120,
     "gpt-oss-120b-eagle3-online.yaml": 60,
     "gpt-oss-20b-eagle3-online.yaml": 60,
     "ling-flash-2.0-eagle3-online.yaml": 60,
+    "qwen3-4b-dspark-deepspec-offline.yaml": 10,
     "qwen3-8b-peagle-disaggregated.yaml": 120,
     "qwen3-coder-30b-a3b-eagle3-online.yaml": 60,
+    "qwen3.8-flash-next-dspark-offline.yaml": 10,
 }
 
 LEGACY_EPOCH_OVERRIDES = {
@@ -151,7 +156,7 @@ class UnifiedFeatureReachabilityTest(unittest.TestCase):
             for path in EXAMPLE_CONFIG_DIR.glob("*.yaml")
             if not path.name.startswith(".")
         )
-        self.assertEqual(len(paths), 56)
+        self.assertEqual(len(paths), 63)
 
         resolved_runs = {
             path.name: resolve_run(Config.from_file(str(path))) for path in paths

@@ -268,9 +268,23 @@ def _disaggregated_env(
     if cfg.mode == "online":
         if deployment.backend != "mooncake":
             raise ValueError("online disaggregated training requires Mooncake")
-        # Online feature objects are allocated by the external capture server.
-        # SpecForge roles only read or publish references to those objects.
-        values["DISAGG_CLIENT_SEGMENT_SIZE"] = "0"
+        # Ordinary online objects are allocated by the external capture server.
+        # Windowed online is different: the producer materializes 48 child
+        # objects after reading one server-owned parent, so it needs a positive
+        # Mooncake segment of its own.
+        if role == "producer" and cfg.data.windowed_online is not None:
+            segment_size = _offline_producer_segment_size(
+                deployment.producer_segment_size, base_env
+            )
+            if segment_size is None:
+                raise ValueError(
+                    "windowed online producer requires a positive "
+                    "deployment.disaggregated.producer_segment_size or "
+                    "MOONCAKE_GLOBAL_SEGMENT_SIZE"
+                )
+            values["DISAGG_CLIENT_SEGMENT_SIZE"] = str(segment_size)
+        else:
+            values["DISAGG_CLIENT_SEGMENT_SIZE"] = "0"
         values.update(
             {
                 "DISAGG_REF_CHANNEL": str(control_dir / "refs.jsonl"),
@@ -572,7 +586,10 @@ def _validate_consumer_database(
     if not database:
         raise ValueError("online disaggregated consumer requires a metadata database")
     state_owner = int(base_env["RANK"]) == 0 if distributed else node_rank in (None, 0)
-    if cfg.training.resume_from:
+    retained_attempt_resume = (
+        cfg.training.resume_from and cfg.data.windowed_online is None
+    )
+    if retained_attempt_resume:
         if state_owner and not os.path.exists(database):
             raise ValueError(
                 "consumer resume requires the retained metadata database: "

@@ -28,7 +28,7 @@ from specforge.inference.capture import (
     CaptureMismatchError,
     verify_capture,
 )
-from specforge.runtime.contracts import PromptTask, SampleRef
+from specforge.runtime.contracts import PromptTask, SampleRef, SampleRefGroup
 
 # health states: a worker REPORTS health; the controller decides scheduling.
 HEALTH_STATES = ("starting", "ready", "paused", "draining", "unhealthy", "stopped")
@@ -254,9 +254,50 @@ class RolloutWorker:
             raise ValueError(reason)
 
         refs: List[SampleRef] = []
-        for result in results:
+        for task, result in zip(tasks, results):
             if isinstance(result, SampleRef):
                 refs.append(result)
+                continue
+            if isinstance(result, SampleRefGroup):
+                if result.task_id != task.task_id:
+                    reason = (
+                        "produce_refs returned a ref group for the wrong task: "
+                        f"{result.task_id!r} != {task.task_id!r}"
+                    )
+                    self.controller.fail_prompt_tasks(
+                        self.worker_id,
+                        [task.task_id],
+                        reason=reason,
+                        retryable=False,
+                    )
+                    self._inflight = 0
+                    raise ValueError(reason)
+                if not result.refs:
+                    reason = (
+                        f"produce_refs returned an empty ref group for {task.task_id}"
+                    )
+                    self.controller.fail_prompt_tasks(
+                        self.worker_id,
+                        [task.task_id],
+                        reason=reason,
+                        retryable=False,
+                    )
+                    self._inflight = 0
+                    raise ValueError(reason)
+                if any(ref.source_task_id != task.task_id for ref in result.refs):
+                    reason = (
+                        f"ref group for {task.task_id} contains a ref with a "
+                        "different source_task_id"
+                    )
+                    self.controller.fail_prompt_tasks(
+                        self.worker_id,
+                        [task.task_id],
+                        reason=reason,
+                        retryable=False,
+                    )
+                    self._inflight = 0
+                    raise ValueError(reason)
+                refs.extend(result.refs)
                 continue
 
             task_id = getattr(result, "task_id", None)

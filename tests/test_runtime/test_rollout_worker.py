@@ -8,6 +8,7 @@ import torch
 from specforge.inference.batch_partition import TargetBatchPartition
 from specforge.inference.capture import CaptureConfig
 from specforge.inference.rollout_worker import RolloutWorker
+from specforge.runtime.contracts import SampleRefGroup
 from specforge.runtime.control_plane import DataFlowController
 from specforge.runtime.data_plane import LocalFeatureStore
 
@@ -83,7 +84,51 @@ class ShardedSource(FakeSource):
         return super().generate_features(self.partition.select(tasks), capture=capture)
 
 
+class GroupedRefSource:
+    def __init__(self, store):
+        self.store = store
+
+    def produce_refs(self, tasks, *, capture):
+        out = []
+        for task in tasks:
+            refs = []
+            for index in range(3):
+                refs.append(
+                    self.store.put(
+                        {"input_ids": torch.tensor([[index]])},
+                        sample_id=f"{task.task_id}:w{index}",
+                        metadata={
+                            "run_id": "run",
+                            "source_task_id": task.task_id,
+                            "strategy": "eagle3",
+                            "num_tokens": 1,
+                        },
+                    )
+                )
+            out.append(SampleRefGroup(task.task_id, tuple(refs)))
+        return out
+
+
 class TestRolloutWorker(unittest.TestCase):
+    def test_ref_source_can_atomically_fan_out_one_task(self):
+        ctrl = DataFlowController("run")
+        ctrl.ingest_prompts([{"task_id": "parent", "payload": {"text": "a"}}])
+        store = LocalFeatureStore("st")
+        worker = RolloutWorker(
+            ctrl,
+            store,
+            GroupedRefSource(store),
+            _capture(),
+            run_id="run",
+        )
+        worker.start()
+
+        refs = worker.run_once(max_tasks=1)
+
+        self.assertEqual(len(refs), 3)
+        self.assertEqual(ctrl.status()["samples_committed"], 3)
+        self.assertEqual(ctrl.status()["prompts"], 0)
+
     def test_run_once_commits_refs(self):
         ctrl = DataFlowController("run")
         ctrl.ingest_prompts([{"payload": {"text": "a"}}, {"payload": {"text": "b"}}])

@@ -816,6 +816,7 @@ def build_disagg_online_producer(
     sleep=None,
     prompt_epochs: int = 1,
     prompt_seed: int = 0,
+    start_parent: int = 0,
 ):
     """Producer side of an ONLINE disaggregated run (rollout pool).
 
@@ -914,8 +915,14 @@ def build_disagg_online_producer(
     worker_lease = flow_control.prompt_lease(lease)
     build_start = time.perf_counter()
     prompt_epochs = _normalize_prompt_epochs(prompt_epochs)
-    if prompt_epochs > 1:
+    if prompt_epochs > 1 and not getattr(
+        prompts, "is_windowed_parent_plan", False
+    ):
         prompts = list(prompts)
+    if start_parent < 0:
+        raise ValueError("start_parent must be non-negative")
+    if start_parent and not getattr(prompts, "is_windowed_parent_plan", False):
+        raise ValueError("start_parent is supported only by windowed parent plans")
     base_prompt_count = len(prompts) if hasattr(prompts, "__len__") else "unknown"
     producer_timing(
         "build_disagg_online_producer enter "
@@ -1263,26 +1270,69 @@ def build_disagg_online_producer(
 
         try:
             live_workers = list(workers)
-            for epoch in range(prompt_epochs):
+            first_epoch = (
+                start_parent // len(prompts)
+                if getattr(prompts, "is_windowed_parent_plan", False)
+                else 0
+            )
+            if first_epoch > prompt_epochs:
+                raise ValueError(
+                    f"start_parent={start_parent} exceeds the configured prompt plan"
+                )
+            for epoch in range(first_epoch, prompt_epochs):
                 if should_stop is not None and should_stop():
                     break
-                ingest_epoch(epoch)
-                if not live_workers:
-                    raise RuntimeError(
-                        f"all rollout workers were already dropped before "
-                        f"epoch {epoch + 1}/{prompt_epochs} could run — "
-                        f"dead workers: {dead}"
+                if getattr(prompts, "is_windowed_parent_plan", False):
+                    # A 43K parent can occupy several GiB across parent and child
+                    # objects. Materialize and retire one parent at a time rather
+                    # than loading a full epoch of token lists into the controller.
+                    epoch_start = (
+                        start_parent % len(prompts) if epoch == first_epoch else 0
                     )
-                run_epoch_workers(live_workers)
-                stopped = should_stop is not None and should_stop()
-                live_workers = [w for w in live_workers if w.worker_id not in dead]
-                if dead and not stopped and not pool_drained():
-                    raise RuntimeError(
-                        f"all rollout workers exited with {len(dead)} dropped as "
-                        f"dead and prompts remaining — dead workers: {dead}"
+                    epoch_prompts = prompts.iter_epoch(
+                        epoch, start_parent=epoch_start
                     )
-                if stopped:
-                    break
+                    for prompt in epoch_prompts:
+                        controller.ingest_prompts([prompt])
+                        if not live_workers:
+                            raise RuntimeError(
+                                "all rollout workers were dropped before windowed "
+                                f"parent {prompt.get('task_id')} could run"
+                            )
+                        run_epoch_workers(live_workers)
+                        stopped = should_stop is not None and should_stop()
+                        live_workers = [
+                            w for w in live_workers if w.worker_id not in dead
+                        ]
+                        if dead and not stopped and not pool_drained():
+                            raise RuntimeError(
+                                "all rollout workers exited while a windowed "
+                                f"parent remained; dead workers: {dead}"
+                            )
+                        if stopped:
+                            break
+                    if should_stop is not None and should_stop():
+                        break
+                else:
+                    ingest_epoch(epoch)
+                    if not live_workers:
+                        raise RuntimeError(
+                            f"all rollout workers were already dropped before "
+                            f"epoch {epoch + 1}/{prompt_epochs} could run — "
+                            f"dead workers: {dead}"
+                        )
+                    run_epoch_workers(live_workers)
+                    stopped = should_stop is not None and should_stop()
+                    live_workers = [
+                        w for w in live_workers if w.worker_id not in dead
+                    ]
+                    if dead and not stopped and not pool_drained():
+                        raise RuntimeError(
+                            f"all rollout workers exited with {len(dead)} dropped as "
+                            f"dead and prompts remaining — dead workers: {dead}"
+                        )
+                    if stopped:
+                        break
                 st = controller.status()
                 producer_timing(
                     "epoch drained "
@@ -1367,6 +1417,8 @@ def build_disagg_online_consumer(
     dp_size: Optional[int] = None,
     inbox_dir: Optional[str] = None,
     resume_from: Optional[str] = None,
+    fresh_data_resume: bool = False,
+    checkpoint_extra: Optional[dict] = None,
     resume_reset_data_position: bool = False,
     dataloader_num_workers: int = 0,
     profiling_options=None,
@@ -1461,11 +1513,12 @@ def build_disagg_online_consumer(
             skip_ids = None
             requeued_ids = None
             committed = store.committed_count()
-            if resume_from is None:
+            if resume_from is None or fresh_data_resume:
                 if committed > 0:
                     raise ValueError(
                         f"metadata store already holds {committed} committed "
-                        "samples; a fresh online attempt cannot reuse a ledger. "
+                        "samples; a fresh online attempt cannot reuse a ledger "
+                        "(including fresh windowed data replay). "
                         "Set training.resume_from to reconcile this retained "
                         "consumer attempt, or use a new metadata_db_path"
                     )
@@ -1518,7 +1571,7 @@ def build_disagg_online_consumer(
             )
             channel.publish_consumer_quantum(
                 dp_size * batch_size * accumulation_steps,
-                allow_existing=resume_from is not None,
+                allow_existing=resume_from is not None and not fresh_data_resume,
             )
         except BaseException as exc:
             setup_exc = exc
@@ -1659,6 +1712,7 @@ def build_disagg_online_consumer(
             sp_ring_size=sp_ring_size,
             resume_from=resume_from,
             resume_reset_data_position=resume_reset_data_position,
+            checkpoint_extra=checkpoint_extra,
             dataloader_num_workers=dataloader_num_workers,
             profiling_options=profiling_options,
             on_fit_success=mark_consumer_done,

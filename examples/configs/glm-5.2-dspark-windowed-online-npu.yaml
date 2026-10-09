@@ -1,0 +1,74 @@
+model:
+  target_model_path: "/path/to/GLM-5.2"
+  draft_model_config: "configs/glm-5.2-dspark.json"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  lm_head_key: "lm_head.weight"
+  torch_dtype: "bfloat16"
+  trust_remote_code: true
+  attention_chunk_size: 64
+
+data:
+  # Flat little-endian int32 token ring, matching loop_curl.py.
+  parent_bin_path: "/path/to/train.bin"
+  max_length: 1024
+  windowed_online:
+    child_length: 1024
+    overlap: 128
+    children_per_parent: 48
+    shuffle_parents: true
+    wrap_around: true
+  dataloader_num_workers: 0
+
+training:
+  strategy: "dspark"
+  attention_backend: "eager"
+  fsdp_sharding: "FULL_SHARD"
+  batch_size: 1
+  accumulation_steps: 1
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.0
+  max_grad_norm: 0.5
+  tp_size: 1
+  num_anchors: 32
+  dspark_loss_mode: "kl"
+  dspark_kl_loss_alpha: 1.0
+  dspark_confidence_head_alpha: 1.0
+  activation_checkpointing: "attention"
+  # With DP=8, six optimizer steps consume exactly 48 child samples.
+  max_steps: 9996
+  total_steps: 9996
+  save_interval: 996
+  log_interval: 50
+  dist_timeout: 30
+  seed: 42
+
+runtime:
+  producer_lease: 1
+  # One complete parent fan-out is published as 48 refs.
+  in_flight_high_watermark: 48
+  in_flight_low_watermark: 8
+  resident_high_watermark_bytes: 1073741824
+  resident_low_watermark_bytes: 0
+  feature_store_max_resident_bytes: 6442450944
+
+run_id: "glm-5.2-dspark-windowed-online-npu"
+output_dir: "./outputs/glm-5.2-dspark-windowed-online-npu"
+
+deployment:
+  mode: "disaggregated"
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
+  disaggregated:
+    control_dir: outputs/glm-5.2-dspark-windowed-online-npu/control
+    consumer_state_dir: outputs/glm-5.2-dspark-windowed-online-npu/consumer-state
+    backend: "mooncake"
+    # The producer owns roughly 2.25 GiB of child tensors per parent.
+    producer_segment_size: 6442450944
+    client_buffer_size: 1073741824
+    server_urls:
+      - http://127.0.0.1:30000
+    mooncake_metadata_server: http://127.0.0.1:35880/metadata
+    mooncake_master_server_addr: 127.0.0.1:35551
+    mooncake_protocol: tcp
