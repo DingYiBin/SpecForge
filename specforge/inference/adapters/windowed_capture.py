@@ -93,8 +93,16 @@ class WindowedServerCaptureAdapter:
             ].contiguous(),
         }
         child_id = f"{parent.sample_id}:w{window_index:04d}"
+        # Exclude the parent's "generation": the child's own put() assigns a
+        # fresh store generation, and the merged metadata below must not stomp
+        # it with the parent's — MooncakeFeatureStore.get() locates tensors by
+        # the ref's generation, so a stale value makes the child unreadable.
         metadata = {
-            **dict(parent.metadata),
+            **{
+                k: v
+                for k, v in parent.metadata.items()
+                if k != "generation"
+            },
             "run_id": parent.run_id,
             "source_task_id": task.task_id,
             "strategy": parent.strategy,
