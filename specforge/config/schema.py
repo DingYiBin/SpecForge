@@ -312,7 +312,10 @@ class ManagedLocalMooncakeConfig(StrictConfigModel):
     metadata_port: int = Field(default=35880, gt=0, le=65535)
     metrics_port: int = Field(default=35903, gt=0, le=65535)
     local_hostname: str = "127.0.0.1"
-    protocol: Literal["tcp", "rdma"] = "tcp"
+    #: "tcp" forces the engine-level MC_FORCE_TCP escape hatch (NPU wheels
+    #: install the Ascend transport unconditionally otherwise); "ascend"
+    #: attaches an ACL context before setup; "rdma" passes through unchanged.
+    protocol: Literal["tcp", "ascend", "rdma"] = "tcp"
     rdma_devices: Optional[str] = None
     global_segment_size_bytes: int = Field(default=32 << 30, gt=0)
     local_buffer_size_bytes: int = Field(default=1 << 30, gt=0)

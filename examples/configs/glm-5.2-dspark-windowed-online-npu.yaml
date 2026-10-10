@@ -71,4 +71,9 @@ deployment:
       - http://127.0.0.1:30000
     mooncake_metadata_server: http://127.0.0.1:35880/metadata
     mooncake_master_server_addr: 127.0.0.1:35551
+    # "tcp" must match the capture server's transport. On NPU wheels the
+    # engine installs the Ascend transport unconditionally; SpecForge sets
+    # MC_FORCE_TCP=1 automatically for "tcp" (no ACL context needed on the
+    # trainer roles). Use "ascend" only when every peer (capture server,
+    # producer, consumer) is NPU and configured identically.
     mooncake_protocol: tcp

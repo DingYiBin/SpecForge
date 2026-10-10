@@ -54,6 +54,7 @@ a tombstone-then-free protocol — a follow-up tied to the shared metadata index
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -74,6 +75,32 @@ _MOONCAKE_SETUP_DEFAULTS = {
     "protocol": "tcp",  # bring up on TCP; flip to "rdma" once NICs are verified
     "rdma_devices": "",
 }
+
+
+def _link_engine_transport(protocol: str) -> None:
+    """Make the engine-level transport match the requested store protocol.
+
+    NPU wheels (``mooncake-transfer-engine-npu``) unconditionally install the
+    Ascend transport at the engine level regardless of the ``protocol`` passed
+    to ``setup()`` — that install needs an ACL device context and fails with
+    ``rtGetDevMsg ... context is a null pointer`` on context-less processes
+    (the trainer roles). ``MC_FORCE_TCP`` is the engine's only pure-TCP escape
+    hatch (mooncake ``transfer_engine_impl.cpp``). Setting it for ``tcp``
+    mirrors the capture-server side (vllm ``spec_capture_sink.py`` /
+    ``curl_tokens_mooncake.py``): all peers must agree on one transport.
+    """
+    if protocol == "tcp":
+        os.environ.setdefault("MC_FORCE_TCP", "1")
+    elif protocol == "ascend":
+        # Ascend transport requires a current ACL context on the calling
+        # thread; attach one when torch_npu is available (bare trainer
+        # processes have none). Mirrors the PD prefix-sharing pattern.
+        try:
+            import torch_npu  # noqa: F401  # registers NPU support in torch
+            torch.npu.set_device(
+                int(os.environ.get("MOONCAKE_ASCEND_DEVICE", "0")))
+        except ImportError:
+            pass  # non-NPU host: let mooncake surface the engine error
 
 
 class _InjectedReplicateConfig:
@@ -105,6 +132,7 @@ def _connect_store(setup_kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
             "`mooncake-transfer-engine-cuda13` for CUDA >= 13)."
         ) from e
     store = MooncakeDistributedStore()
+    _link_engine_transport(str(setup_kwargs.get("protocol", "tcp")))
     rc = store.setup(**setup_kwargs)
     if rc is not None and int(rc) != 0:
         raise RuntimeError(

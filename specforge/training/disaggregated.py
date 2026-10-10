@@ -701,6 +701,9 @@ def _build_online(
                 schema=capture_schema,
                 request_input_adapter=input_adapter,
                 target_model_version=cfg.model.target_model_path,
+                # vLLM capture servers (ascend-pytorch-inference) take one
+                # prompt + one spec_capture payload per /generate request.
+                one_request_per_task=True,
             )
             for url in _server_urls(cfg)
         ]

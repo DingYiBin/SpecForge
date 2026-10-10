@@ -136,6 +136,7 @@ class SGLangServerCaptureAdapter:
         timeout_s: float = 300.0,
         post_fn: Optional[Callable[..., Any]] = None,
         target_model_version: str = "unknown",
+        one_request_per_task: bool = False,
     ) -> None:
         required_store_api = (
             "adopt",
@@ -170,6 +171,9 @@ class SGLangServerCaptureAdapter:
         self.timeout_s = timeout_s
         self.post_fn = post_fn or _default_post
         self.target_model_version = target_model_version
+        # vLLM-style capture servers take one prompt (and one spec_capture
+        # payload) per /generate request; sglang batches n prompts per call.
+        self.one_request_per_task = one_request_per_task
         self._healthy = True
 
     # -- request construction -------------------------------------------------
@@ -316,6 +320,13 @@ class SGLangServerCaptureAdapter:
         transport-level error raises — the worker fails the whole lease batch
         retryable, mirroring ``generate_features`` semantics.
         """
+        if self.one_request_per_task and len(tasks) > 1:
+            # vLLM capture servers accept one prompt per request; fan out and
+            # stitch, preserving order and per-task failure semantics.
+            out: List[Union[Any, ServerCaptureFailure]] = []
+            for task in tasks:
+                out.extend(self.produce_refs([task], capture=capture))
+            return out
         body = self._request_inputs(tasks)
         body["sampling_params"] = {"temperature": 0.0, "max_new_tokens": 1}
         capture_payloads = [self._spec_capture_payload(t) for t in tasks]
@@ -350,8 +361,10 @@ class SGLangServerCaptureAdapter:
             meta = row.get("meta_info") or {}
             # meta_info["spec_capture"] is the per-request result dict (or an
             # {"error": ...} marker) from the server's dedicated output field.
+            # sglang wraps it in meta_info; the vLLM capture server returns it
+            # as a top-level "spec_capture" row field instead.
             result = _capture_result_for_task(
-                meta.get("spec_capture"),
+                meta.get("spec_capture") if meta else row.get("spec_capture"),
                 task_id=task.task_id,
                 expected_sample_id=self._sample_id(task),
             )

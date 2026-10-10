@@ -30,6 +30,13 @@ overlap tokens and supervises its remaining 896 tokens.
   keeps one parent capture in flight and publishes children in order.
 - The server, producer, and consumer must use the same Mooncake metadata/master
   endpoints and store id.
+- All peers must agree on one transport: set `deployment.disaggregated.
+  mooncake_protocol` (and the capture server's `MOONCAKE_PROTOCOL`) to the same
+  value. `tcp` is the default and the verified bring-up path on NPU wheels —
+  SpecForge sets the engine-level `MC_FORCE_TCP` escape hatch automatically,
+  so the trainer roles need no ACL device context. `ascend` requires every
+  peer to hold an NPU context (plus `HCCL_INTRA_ROCE_ENABLE=1` cross-machine)
+  and is only worth it after the RoCE fabric is verified.
 - The producer needs a positive Mooncake segment because it owns the child
   objects. For GLM-5.2 BF16 with three auxiliary layers, one 48-child group is
   about 2.25 GiB before allocator overhead.
