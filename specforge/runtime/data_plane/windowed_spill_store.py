@@ -164,6 +164,20 @@ class WindowedFileSpillStore:
                 "consumer is behind"
             )
 
+    def over_budget(self, extra_bytes: int = 0) -> bool:
+        """True when the spill directory already leaves no headroom.
+
+        Producer-side backpressure probe: lets the drive loop pause BEFORE
+        leasing a parent, because discovering the overflow inside ``put()``
+        costs a full server capture (~43k-token generate) plus a 2.8 GiB
+        parent fetch on every retry.
+        """
+        if self.spill_max_bytes is None:
+            return False
+        run_dir = os.path.join(self.spill_root, _sanitize_component(self.run_id))
+        used = _spill_dir_bytes(run_dir) if os.path.isdir(run_dir) else 0
+        return used + int(extra_bytes) > self.spill_max_bytes
+
     # -- child write/read/free (files) --------------------------------------
     def put(
         self,

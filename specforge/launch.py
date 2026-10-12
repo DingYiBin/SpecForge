@@ -1090,10 +1090,16 @@ def build_disagg_online_producer(
                 _resident = resident_bytes()
                 # backpressure: in_flight = published - consumer-acked
                 backpressure_started = time.monotonic()
+                # Spill-budget probe BEFORE leasing: discovering overflow in
+                # put() burns a full server capture + parent fetch per retry.
+                # Headroom check only (over_budget(0)): put()'s precise check
+                # still guards the not-yet-over case, at the cost of at most
+                # one wasted round.
+                _spill_over_budget = getattr(feature_store, "over_budget", None)
                 while flow_control.should_pause(
                     in_flight_refs=_infl,
                     resident_bytes=_resident,
-                ):
+                ) or (callable(_spill_over_budget) and _spill_over_budget(0)):
                     now = time.perf_counter()
                     if (
                         progress_interval > 0
@@ -1105,6 +1111,7 @@ def build_disagg_online_producer(
                             f"worker={w.worker_id} produced={state['produced']} "
                             f"in_flight={channel.in_flight_remote()} "
                             f"resident_bytes={resident_bytes()} "
+                            f"spill_over_budget={bool(_spill_over_budget(0)) if callable(_spill_over_budget) else 'n/a'} "
                             f"pending={st['prompts_pending']} "
                             f"leased={st['prompts_leased']} "
                             f"elapsed={elapsed(drive_start)}"
