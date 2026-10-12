@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 
+import time
+
 from dataclasses import replace
 from typing import Any, List
 
@@ -171,6 +173,7 @@ class WindowedServerCaptureAdapter:
     def produce_refs(
         self, tasks: List[PromptTask], *, capture: CaptureConfig
     ) -> List[Any]:
+        _capture_start = time.perf_counter()
         parent_results = self.parent_source.produce_refs(tasks, capture=capture)
         if len(parent_results) != len(tasks):
             raise RuntimeError(
@@ -178,6 +181,10 @@ class WindowedServerCaptureAdapter:
                 f"{len(parent_results)} records for {len(tasks)} tasks"
             )
         results: List[Any] = []
+        phase_t0 = time.perf_counter()
+        capture_s = phase_t0 - _capture_start
+        fetch_s = 0.0
+        fanout_s = 0.0
         for task, parent in zip(tasks, parent_results):
             if not isinstance(parent, SampleRef):
                 results.append(parent)
@@ -185,12 +192,15 @@ class WindowedServerCaptureAdapter:
             children: list[SampleRef] = []
             handle = None
             try:
+                _t = time.perf_counter()
                 tensors, handle = self.store.get(
                     parent,
                     device="cpu",
                     names=[self.aux_feature, self.last_hidden_feature],
                 )
+                fetch_s += time.perf_counter() - _t
                 self._validate_parent(task, parent, tensors)
+                _t = time.perf_counter()
                 for window_index in range(self.children_per_parent):
                     children.append(
                         self._child_ref(
@@ -201,6 +211,7 @@ class WindowedServerCaptureAdapter:
                             capture=capture,
                         )
                     )
+                fanout_s += time.perf_counter() - _t
             except BaseException:
                 for child in children:
                     self.store.abort(child.sample_id, reason="window-fanout-failed")
@@ -226,6 +237,14 @@ class WindowedServerCaptureAdapter:
                 reap()
             except Exception as exc:  # best-effort: never kill the producer
                 logger.warning("post-fanout parent gc failed: %s", exc)
+        if results:
+            print(
+                "[windowed-producer] parent group phases "
+                f"tasks={len(tasks)} capture={capture_s:.2f}s "
+                f"fetch={fetch_s:.2f}s fanout={fanout_s:.2f}s "
+                f"total={capture_s + fetch_s + fanout_s:.2f}s",
+                flush=True,
+            )
         return results
 
     def health(self):
