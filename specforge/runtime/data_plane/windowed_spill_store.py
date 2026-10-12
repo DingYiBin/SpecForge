@@ -20,10 +20,14 @@ ever reads it, once) and materializes children as plain files under a shared
 ``spill_root``:
 
 * ``put()`` ``torch.save``s the child tensors to
-  ``{spill_root}/{run_id}/{parent_id}/{child_id}.ckpt`` (staged ``.tmp`` +
+  ``{spill_root}/{run_id}/{sample_id}.ckpt`` (staged ``.tmp`` +
   ``os.replace`` atomic publish) and returns a ``file://``-addressed
   :class:`SampleRef` — the exact ref flavour the offline ``file://`` reader
-  already serves, so ``FeatureDataLoader``/collate need no changes.
+  already serves, so ``FeatureDataLoader``/collate need no changes. The
+  sanitized sample id carries the parent identity in the filename, so the
+  run directory stays flat: per-parent subdirectories would only
+  accumulate as empty husks once the optimizer-boundary abort deletes the
+  child files.
 * ``get()`` on a ``file://`` ref loads the named keys via
   ``load_feature_file`` (``torch.load(mmap=True)``): same-node ranks share the
   OS page cache, so the physical read happens once per node per child.
@@ -78,10 +82,6 @@ def _sanitize_component(raw: str) -> str:
     return raw.replace(_COLON, _COLON_ESC)
 
 
-def _desanitize_component(safe: str) -> str:
-    return safe.replace(_COLON_ESC, _COLON)
-
-
 def _spill_dir_bytes(root: str) -> int:
     """Recursive byte size of a directory tree (files + directories)."""
     total = 0
@@ -133,23 +133,18 @@ class WindowedFileSpillStore:
 
     # -- layout ------------------------------------------------------------
     def _child_path(self, sample_id: str) -> str:
-        """``{spill_root}/{run_id}/{parent}/{child}.ckpt`` for one sample id.
+        """``{spill_root}/{run_id}/{sample_id}.ckpt`` for one sample id.
 
-        A child id is ``{run_id}:{parent_task_id}:w{index}`` and the parent id
-        is ``{run_id}:{parent_task_id}``, so splitting the sanitized id from
-        the right once yields (parent, child). A raw non-windowed id (no
-        ``:w`` suffix, e.g. a plain producer-put sample) collapses to a
-        single component under the run directory.
+        The sanitized child id is ``{run_id}__{parent_task_id}__w{index}``,
+        so the flat filename already carries the parent identity. Per-parent
+        subdirectories were tried first and accumulate as empty husks: only
+        the child *files* are removed at the optimizer-boundary abort, nobody
+        removes the directory. A raw non-windowed id (no ``:w`` suffix, e.g. a
+        plain producer-put sample) maps to a flat file the same way.
         """
-        safe = _sanitize_component(sample_id)
-        head, _, tail = safe.rpartition(_COLON_ESC)
-        if head and tail.startswith("w") and tail[1:].isdigit():
-            parent, child = _desanitize_component(head), tail
-        else:
-            parent, child = "_misc", safe
         run_dir = _sanitize_component(self.run_id)
         return os.path.join(
-            self.spill_root, run_dir, _sanitize_component(parent), f"{child}.ckpt"
+            self.spill_root, run_dir, f"{_sanitize_component(sample_id)}.ckpt"
         )
 
     def _ensure_dir(self, path: str) -> None:

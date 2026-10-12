@@ -52,13 +52,16 @@ class WindowedFileSpillStoreTest(unittest.TestCase):
         self.assertTrue(ref.feature_store_uri.startswith("file://"))
         self.assertEqual(ref.feature_keys, {"input_ids": "input_ids"})
         self.assertEqual(ref.estimated_bytes, 8 * 8 + 8 * 4 * 2)
-        # layout: {root}/{run}/{parent}/w0008.ckpt
+        # layout: {root}/{run}/{parent}__w0008.ckpt (flat; parent id in the name)
         rel = os.path.relpath(
             ref.feature_store_uri[len("file://") :], self.root
         )
         self.assertEqual(
             rel,
-            os.path.join(RUN.replace(":", "__"), PARENT_ID.replace(":", "__"), "w0008.ckpt"),
+            os.path.join(
+                RUN.replace(":", "__"),
+                f"{PARENT_ID.replace(':', '__')}__w0008.ckpt",
+            ),
         )
 
     def test_child_roundtrip_and_abort_deletes_file(self):
