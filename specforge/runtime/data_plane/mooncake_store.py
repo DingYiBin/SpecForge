@@ -667,8 +667,8 @@ class MooncakeFeatureStore(FeatureStore):
     def drain_pending_removals(
         self,
         *,
-        max_attempts: int = 8,
-        retry_interval_s: float = 0.25,
+        max_attempts: int = 3,
+        retry_interval_s: float = 12.0,
         sleep: Callable[[float], None] = time.sleep,
     ) -> Dict[str, int]:
         """Retry deferred removes at lifecycle shutdown or fail loudly.
@@ -679,6 +679,12 @@ class MooncakeFeatureStore(FeatureStore):
         raises with the remaining sample ids when the remote RPC cannot drain.
         ``sleep`` is injectable so protocol tests can advance a fake lease clock
         without wall-clock delays.
+
+        The default window (3 attempts x 12s) deliberately outlasts Mooncake's
+        ``DEFAULT_KV_LEASE_TTL`` (10s): a remove that failed only because a
+        read lease was live succeeds on the first retry *after* the lease
+        expires, and no retry in between renews it (the exist probe is
+        disabled except on the final attempt).
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")

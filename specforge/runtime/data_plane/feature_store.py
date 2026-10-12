@@ -159,8 +159,8 @@ class FeatureStore(abc.ABC):
 def drain_feature_store_removals(
     store: FeatureStore,
     *,
-    max_attempts: int = 8,
-    retry_interval_s: float = 0.25,
+    max_attempts: int = 3,
+    retry_interval_s: float = 12.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, int]:
     """Bound lifecycle shutdown until deferred physical removes settle.
@@ -169,10 +169,11 @@ def drain_feature_store_removals(
     may expose ``drain_pending_removals`` to retry fallible RPCs.  Keeping this
     small adapter at the FeatureStore boundary lets online producer/consumer
     finalization enforce the same loud contract without depending on Mooncake's
-    concrete class. The default is bounded to eight attempts and 1.75 seconds of
-    inter-attempt waiting; Mooncake's implementation avoids existence probes
-    between attempts so those waits let an existing read lease expire rather
-    than renewing it.
+    concrete class. The default is bounded to three attempts with 12 seconds of
+    inter-attempt waiting — past Mooncake's read-lease TTL (10s) — because a
+    lease-blocked remove succeeds on the first retry after expiry; Mooncake's
+    implementation avoids existence probes between attempts so those waits let
+    an existing read lease expire rather than renewing it.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")

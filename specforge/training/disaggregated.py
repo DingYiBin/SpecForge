@@ -156,6 +156,34 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     )
 
 
+def _windowed_spill_store(cfg: Config, mooncake):
+    """A' data plane for windowed online: Mooncake parents + spill-file children.
+
+    Requires ``deployment.disaggregated.spill_root``; the producer and all
+    trainer ranks must share it (same node or same shared mount).
+    """
+    deployment = cfg.deployment.disaggregated
+    spill_root = (
+        getattr(deployment, "spill_root", None) if deployment is not None else None
+    )
+    if not spill_root:
+        raise ValueError(
+            "data.windowed_online requires deployment.disaggregated.spill_root "
+            "(a directory shared by the producer and every trainer rank, e.g. "
+            "node-local /tmp)"
+        )
+    from specforge.runtime.data_plane.windowed_spill_store import (
+        WindowedFileSpillStore,
+    )
+
+    return WindowedFileSpillStore(
+        mooncake,
+        spill_root=spill_root,
+        run_id=cfg.run_id,
+        spill_max_bytes=cfg.runtime.feature_store_max_resident_bytes,
+    )
+
+
 def _offline_store(cfg: Config, *, retain_on_release: bool = False):
     backend = os.environ.get("DISAGG_BACKEND", "shared_dir")
     if backend == "mooncake":
@@ -614,6 +642,11 @@ def _build_online(
     # retain materialized features until DPAckController commits the optimizer
     # boundary and explicitly aborts the acknowledged ids.
     store = _mooncake_store(cfg, retain_on_release=cfg.training.role == "consumer")
+    if cfg.data.windowed_online is not None:
+        # A' data plane: parents stay on Mooncake (server -> producer, once),
+        # children become spill files under the shared spill_root so trainer
+        # ranks mmap them locally instead of crossing the wire per child.
+        store = _windowed_spill_store(cfg, store)
     from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 

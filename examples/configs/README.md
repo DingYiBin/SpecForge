@@ -286,6 +286,7 @@ For `deployment.mode: disaggregated`, also write:
 | `deployment.disaggregated.mooncake_local_hostname` | `null` | Node-local Mooncake transfer hostname; usually supplied through the environment. |
 | `deployment.disaggregated.mooncake_protocol` | `null` | External transfer protocol such as `tcp` or `rdma`. |
 | `deployment.disaggregated.mooncake_rdma_devices` | `null` | External Mooncake RDMA-device selection. |
+| `deployment.disaggregated.spill_root` | `null` | Windowed online (`data.windowed_online`) per-child spill directory. The producer writes one `.ckpt` per child here and trainer ranks mmap them; must be shared by the producer and every trainer rank (e.g. node-local `/tmp`). Required when `data.windowed_online` is configured; invalid otherwise. |
 | `deployment.disaggregated.producer_segment_size` | `null` | Positive allocation owned by an offline Mooncake producer. Online capture is server-owned and forces client segments to zero. |
 | `deployment.disaggregated.client_buffer_size` | `268435456` | Per-role Mooncake client buffer in bytes. |
 | `deployment.disaggregated.idle_timeout_s` | `null` | Positive consumer idle timeout. |

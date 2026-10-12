@@ -87,6 +87,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 "children_per_parent": 48,
             },
         }
+        payload["deployment"]["disaggregated"]["spill_root"] = "/tmp/specforge-spill"
         payload["runtime"] = {"producer_lease": 1}
         payload["deployment"]["trainer"] = {"nproc_per_node": 8}
         payload["training"].update(
@@ -118,6 +119,7 @@ class ConfigSchemaTest(unittest.TestCase):
             "max_length": 512,
             "windowed_online": {"child_length": 1024},
         }
+        payload["deployment"]["disaggregated"]["spill_root"] = "/tmp/specforge-spill"
         payload["runtime"] = {"producer_lease": 1}
         with self.assertRaisesRegex(ValidationError, "max_length"):
             Config.model_validate(payload)

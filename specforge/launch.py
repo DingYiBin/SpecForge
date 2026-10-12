@@ -1053,7 +1053,11 @@ def build_disagg_online_producer(
             st = controller.status()
             # leased counts too: a peer's in-flight lease may fail retryable
             # and come back — leaving then would strand it.
-            return st["prompts_pending"] == 0 and st["prompts_leased"] == 0
+            return (
+                st["prompts_pending"] == 0
+                and st["prompts_leased"] == 0
+                and st["prompts_failed"] == 0
+            )
 
         def reconcile_consumed_locked() -> int:
             consumed = channel.consumed_remote()
@@ -1209,9 +1213,23 @@ def build_disagg_online_producer(
                 elif pool_drained():
                     producer_timing(
                         f"pool drained worker={w.worker_id} produced={state['produced']} "
+                        f"prompts_failed={controller.status()['prompts_failed']} "
                         f"elapsed={elapsed(drive_start)}"
                     )
                     return
+                elif controller.status()["prompts_failed"] and not (
+                    should_stop is not None and should_stop()
+                ):
+                    # Terminal capture failure: every retry for this prompt is
+                    # burned. Fail the channel now instead of "draining" every
+                    # remaining windowed parent (the pool will never be empty
+                    # while the failed prompt stays leased-and-dead, so EOF
+                    # would never be published and consumers would hang).
+                    raise RuntimeError(
+                        "rollout worker exiting on terminally failed prompt(s): "
+                        f"{controller.status()['prompts_failed']} failed; "
+                        "refusing to publish a successful EOF for partial data"
+                    )
                 else:
                     # leased nothing: peers hold the remaining prompts (their
                     # leases may yet fail back into the pool) — wait, retry.

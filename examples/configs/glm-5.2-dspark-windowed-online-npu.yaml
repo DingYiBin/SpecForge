@@ -45,11 +45,14 @@ training:
 
 runtime:
   producer_lease: 1
-  # One complete parent fan-out is published as 48 refs.
-  in_flight_high_watermark: 48
-  in_flight_low_watermark: 8
+  # Child consumption is now a local mmap, so the pipeline can hold several
+  # parent groups in flight (48 refs = one parent).
+  in_flight_high_watermark: 192
+  in_flight_low_watermark: 96
   resident_high_watermark_bytes: 1073741824
   resident_low_watermark_bytes: 0
+  # Bounds the /tmp spill directory (raises MemoryError on the producer when
+  # the consumer falls behind).
   feature_store_max_resident_bytes: 6442450944
 
 run_id: "glm-5.2-dspark-windowed-online-npu"
@@ -64,8 +67,14 @@ deployment:
     control_dir: outputs/glm-5.2-dspark-windowed-online-npu/control
     consumer_state_dir: outputs/glm-5.2-dspark-windowed-online-npu/consumer-state
     backend: "mooncake"
-    # The producer owns roughly 2.25 GiB of child tensors per parent.
-    producer_segment_size: 6442450944
+    # Windowed A' data plane: children are written as spill files here (one
+    # .ckpt per child) and mmapped by the trainer ranks; Mooncake carries only
+    # the parent. Must be shared by the producer and all trainer ranks
+    # (node-local /tmp, e.g. a 1TB tmpfs).
+    spill_root: /tmp/specforge-spill
+    # Mooncake only needs to hold one parent (~2.8 GiB) plus headroom now
+    # that children bypass it.
+    producer_segment_size: 4294967296
     client_buffer_size: 1073741824
     server_urls:
       - http://127.0.0.1:30000

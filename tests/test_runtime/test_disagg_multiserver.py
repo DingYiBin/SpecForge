@@ -557,6 +557,30 @@ class TestMultiServerProducer(unittest.TestCase):
         with self.assertRaises(ValueError):
             _build(adapters, _prompts(2), store, channel, num_rollout_workers=3)
 
+    def test_terminal_prompt_failure_fails_channel_immediately(self):
+        # EOF fail-fast: once a prompt burns through its retries and goes
+        # terminal, the worker must fail the channel on its very next empty
+        # round instead of spinning through every remaining prompt — the pool
+        # never drains while the failed prompt stays unleased-and-dead, so a
+        # "drain" reading would leave consumers hanging forever.
+        backend = _FakeMooncakeStore()
+        stub = _StubCaptureServer(backend, error_sample_ids={"run0:p0"})
+        store = MooncakeFeatureStore(store=backend, store_id="run0")
+        N = 5
+        channel = StreamingRefChannel(os.path.join(self._workdir(), "refs.jsonl"))
+        _workers, drive = _build(
+            [_adapter(store, stub)],
+            _prompts(N),
+            store,
+            channel,
+            lease=2,
+            max_prompt_attempts=2,
+        )
+        with self.assertRaisesRegex(RuntimeError, "terminally failed prompt"):
+            drive(max_rounds=10_000)
+        self.assertFalse(channel.is_closed())
+        self.assertIn("terminally failed prompt", channel.failure())
+
 
 if __name__ == "__main__":
     unittest.main()

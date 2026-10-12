@@ -47,6 +47,7 @@ def _config():
                     "backend": "mooncake",
                     "server_urls": ["http://capture"],
                     "producer_segment_size": 6 << 30,
+                    "spill_root": "/tmp/specforge-spill",
                 },
             },
         }

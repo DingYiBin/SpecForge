@@ -89,7 +89,8 @@ EXPECTED_DISAGGREGATED = {
             "outputs/glm-5.2-dspark-windowed-online-npu/consumer-state"
         ),
         "backend": "mooncake",
-        "producer_segment_size": 6442450944,
+        "spill_root": "/tmp/specforge-spill",
+        "producer_segment_size": 4294967296,
         "client_buffer_size": 1073741824,
         "server_urls": ["http://127.0.0.1:30000"],
         **LOCAL_MOONCAKE_ENDPOINTS,

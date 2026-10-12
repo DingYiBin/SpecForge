@@ -426,6 +426,12 @@ class DisaggregatedDeploymentConfig(StrictConfigModel):
     backend: Literal["shared_dir", "mooncake"]
     store_root: Optional[str] = None
     store_id: Optional[str] = None
+    #: Windowed online (A' data plane) root for per-child spill files. The
+    #: producer writes one .ckpt per child here; trainer ranks mmap them from
+    #: the same path, so it must be shared by the producer and every trainer
+    #: rank (typically node-local /tmp). Required when data.windowed_online
+    #: is configured.
+    spill_root: Optional[str] = None
     server_urls: List[str] = Field(default_factory=list)
     mooncake_metadata_server: Optional[str] = None
     mooncake_master_server_addr: Optional[str] = None
@@ -863,6 +869,22 @@ class Config(StrictConfigModel):
             raise ValueError(
                 "data.windowed_online currently requires an externally managed "
                 "capture server and Mooncake deployment"
+            )
+        spill_root = (
+            self.deployment.disaggregated.spill_root
+            if self.deployment.disaggregated is not None
+            else None
+        )
+        if windowed is not None and not spill_root:
+            raise ValueError(
+                "data.windowed_online requires deployment.disaggregated.spill_root "
+                "(a directory shared by the producer and every trainer rank, "
+                "e.g. node-local /tmp) for the per-child spill files"
+            )
+        if spill_root is not None and windowed is None:
+            raise ValueError(
+                "deployment.disaggregated.spill_root is valid only for "
+                "data.windowed_online online training"
             )
         consumer_state_dir = (
             self.deployment.disaggregated.consumer_state_dir
