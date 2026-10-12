@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import replace
 from typing import Any, List
 
@@ -9,6 +11,8 @@ import torch
 
 from specforge.inference.capture import CaptureConfig, verify_capture_specs
 from specforge.runtime.contracts import PromptTask, SampleRef, SampleRefGroup
+
+logger = logging.getLogger(__name__)
 
 
 class WindowedServerCaptureAdapter:
@@ -206,6 +210,22 @@ class WindowedServerCaptureAdapter:
                 if handle is not None:
                     self.store.release(handle, reason="window-parent-fanned-out")
             results.append(SampleRefGroup(task.task_id, tuple(children)))
+
+        # Producer-side reaping: the parent release above frees the Mooncake
+        # object, but the immediate remove can collide with the read lease
+        # granted by our own get() (10s TTL, -706); the free is then parked
+        # in the backend's pending-removal table and would only be retried
+        # at shutdown. The consumer-side dataloader runs store.gc() every
+        # 15s, but the producer has no such loop — without this reap each
+        # ~GB parent lingers in Mooncake for the whole run. By the next
+        # fan-out the previous parent's lease has long expired, so the
+        # pending remove succeeds.
+        reap = getattr(self.store, "gc", None)
+        if callable(reap):
+            try:
+                reap()
+            except Exception as exc:  # best-effort: never kill the producer
+                logger.warning("post-fanout parent gc failed: %s", exc)
         return results
 
     def health(self):
