@@ -1332,53 +1332,81 @@ def build_disagg_online_producer(
                 if should_stop is not None and should_stop():
                     break
                 if getattr(prompts, "is_windowed_parent_plan", False):
-                    # A 43K parent can occupy several GiB across parent and child
-                    # objects. Materialize and retire parents in small batches
-                    # rather than loading a full epoch of token lists into the
-                    # controller. The batch is as wide as the live worker set:
-                    # N workers capture N parents concurrently (the blocking
-                    # HTTP prefill releases the GIL), which overlaps the ~3.6s
-                    # fetch+fan-out of one group with the ~3.2s capture of the
-                    # next and keeps the producer at the trainer's pace.
-                    # One group feeds three optimizer steps; strictly serial
-                    # production leaves every rank idle at each group boundary.
+                    # A 43K parent can occupy several GiB across parent and
+                    # child objects, so materialize parents one at a time via a
+                    # feeder thread instead of loading a full epoch of token
+                    # lists into the controller. The feeder keeps the pool
+                    # stocked (one unleased parent per live worker), so a
+                    # worker that finishes its group immediately leases the
+                    # next parent. Batch-synchronous rounds idle the faster
+                    # worker at every round boundary while it waits out the
+                    # peer's queued capture + fetch + fan-out (~4s per round
+                    # with 2 workers), which the trainer sees as a stall every
+                    # workers * 3 optimizer steps. Workers still self-pause on
+                    # the in-flight watermark and the spill-budget probe
+                    # before each lease, so a lagging consumer backpressures
+                    # the pipeline instead of overflowing the spill directory.
                     epoch_start = (
                         start_parent % len(prompts) if epoch == first_epoch else 0
                     )
                     epoch_prompts = prompts.iter_epoch(
                         epoch, start_parent=epoch_start
                     )
-                    pending: list = []
-                    exhausted = False
-                    while not exhausted:
-                        while len(pending) < max(1, len(live_workers)):
-                            try:
-                                pending.append(next(epoch_prompts))
-                            except StopIteration:
-                                exhausted = True
-                                break
-                        if not pending:
-                            break
-                        if not live_workers:
-                            raise RuntimeError(
-                                "all rollout workers were dropped before windowed "
-                                f"parent {pending[0].get('task_id')} could run"
-                            )
-                        controller.ingest_prompts(pending)
-                        pending = []
+                    if not live_workers:
+                        raise RuntimeError(
+                            "all rollout workers were dropped before windowed "
+                            "parents could run"
+                        )
+                    feed_stop = threading.Event()
+                    feed_state: dict = {"error": None}
+
+                    def feed_windowed_epoch() -> None:
+                        try:
+                            # Unleased-parent cap: the controller holds at
+                            # most one leased + one pending parent payload per
+                            # worker in memory.
+                            lookahead = max(1, len(live_workers))
+                            for prompt in epoch_prompts:
+                                if feed_stop.is_set() or (
+                                    should_stop is not None and should_stop()
+                                ):
+                                    return
+                                while (
+                                    controller.status()["prompts_pending"]
+                                    >= lookahead
+                                ):
+                                    if feed_stop.is_set() or (
+                                        should_stop is not None and should_stop()
+                                    ):
+                                        return
+                                    sleep(backpressure_poll_s)
+                                controller.ingest_prompts([prompt])
+                        except BaseException as exc:
+                            feed_state["error"] = exc
+
+                    feeder = threading.Thread(
+                        target=feed_windowed_epoch,
+                        name="windowed-prompt-feeder",
+                        daemon=True,
+                    )
+                    feeder.start()
+                    try:
                         run_epoch_workers(live_workers)
-                        stopped = should_stop is not None and should_stop()
-                        live_workers = [
-                            w for w in live_workers if w.worker_id not in dead
-                        ]
-                        if dead and not stopped and not pool_drained():
-                            raise RuntimeError(
-                                "all rollout workers exited while a windowed "
-                                f"parent remained; dead workers: {dead}"
-                            )
-                        if stopped:
-                            break
-                    if should_stop is not None and should_stop():
+                    finally:
+                        feed_stop.set()
+                        feeder.join()
+                    if feed_state["error"] is not None:
+                        raise feed_state["error"]
+                    stopped = should_stop is not None and should_stop()
+                    live_workers = [
+                        w for w in live_workers if w.worker_id not in dead
+                    ]
+                    if dead and not stopped and not pool_drained():
+                        raise RuntimeError(
+                            "all rollout workers exited while a windowed "
+                            f"parent remained; dead workers: {dead}"
+                        )
+                    if stopped:
                         break
                 else:
                     ingest_epoch(epoch)
