@@ -14,6 +14,10 @@ import torch
 from specforge.inference.capture import CaptureConfig, verify_capture_specs
 from specforge.runtime.contracts import PromptTask, SampleRef, SampleRefGroup
 
+# Minimum spacing between producer-side store.gc() calls; see the reaping
+# comment in produce_refs for why this must outlast Mooncake's 10s read lease.
+_REAP_INTERVAL_S = 12.0
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +40,9 @@ class WindowedServerCaptureAdapter:
     ) -> None:
         self.parent_source = parent_source
         self.store = store
+        # Shared across producer workers (pipelined mode): monotonic clock
+        # of the last store.gc() call; see _REAP_INTERVAL_S.
+        self._last_reap = float("-inf")
         self.child_length = int(child_length)
         self.overlap = int(overlap)
         self.children_per_parent = int(children_per_parent)
@@ -228,15 +235,30 @@ class WindowedServerCaptureAdapter:
         # in the backend's pending-removal table and would only be retried
         # at shutdown. The consumer-side dataloader runs store.gc() every
         # 15s, but the producer has no such loop — without this reap each
-        # ~GB parent lingers in Mooncake for the whole run. By the next
-        # fan-out the previous parent's lease has long expired, so the
-        # pending remove succeeds.
+        # ~GB parent lingers in Mooncake for the whole run.
+        #
+        # THROTTLED to one call per _REAP_INTERVAL_S: the backend's gc()
+        # burns one of the bounded max_release_attempts (3) on a pending
+        # remove EVERY call, even while the read lease is still live. The
+        # pipelined producer runs this ~once per 1.6s (two workers at
+        # ~3.3s/group on a SHARED adapter instance), which exhausted the
+        # retry budget entirely inside the 10s lease window and permanently
+        # skipped every removal — leaking each ~GB parent and eventually
+        # filling the Mooncake pool (run died at step 210 with instant
+        # "not available (freed, stale, or never written)" fetch failures).
+        # With a 12s floor (lease TTL + margin) at most ONE attempt per
+        # pending entry lands inside the lease window; the next eligible
+        # call removes it for good. This instance is shared across
+        # producer workers, so the throttle holds for the combined rate.
         reap = getattr(self.store, "gc", None)
         if callable(reap):
-            try:
-                reap()
-            except Exception as exc:  # best-effort: never kill the producer
-                logger.warning("post-fanout parent gc failed: %s", exc)
+            now = time.monotonic()
+            if now - self._last_reap >= _REAP_INTERVAL_S:
+                self._last_reap = now
+                try:
+                    reap()
+                except Exception as exc:  # best-effort: never kill the producer
+                    logger.warning("post-fanout parent gc failed: %s", exc)
         if results:
             print(
                 "[windowed-producer] parent group phases "
