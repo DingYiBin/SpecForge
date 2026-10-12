@@ -760,6 +760,7 @@ class Config(StrictConfigModel):
                     "data.windowed_online requires runtime.producer_lease=1 so "
                     "only one parent is captured per worker lease"
                 )
+            children = windowed.children_per_parent
             if self.runtime.producer_workers is not None:
                 workers = int(self.runtime.producer_workers)
                 if workers * children > self.runtime.in_flight_high_watermark:
@@ -778,7 +779,6 @@ class Config(StrictConfigModel):
                 * self.training.batch_size
                 * self.training.accumulation_steps
             )
-            children = windowed.children_per_parent
             if self.runtime.in_flight_high_watermark < children:
                 raise ValueError(
                     "data.windowed_online publishes one atomic parent group of "
