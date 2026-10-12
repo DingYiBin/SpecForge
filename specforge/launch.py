@@ -1333,21 +1333,39 @@ def build_disagg_online_producer(
                     break
                 if getattr(prompts, "is_windowed_parent_plan", False):
                     # A 43K parent can occupy several GiB across parent and child
-                    # objects. Materialize and retire one parent at a time rather
-                    # than loading a full epoch of token lists into the controller.
+                    # objects. Materialize and retire parents in small batches
+                    # rather than loading a full epoch of token lists into the
+                    # controller. The batch is as wide as the live worker set:
+                    # N workers capture N parents concurrently (the blocking
+                    # HTTP prefill releases the GIL), which overlaps the ~3.6s
+                    # fetch+fan-out of one group with the ~3.2s capture of the
+                    # next and keeps the producer at the trainer's pace.
+                    # One group feeds three optimizer steps; strictly serial
+                    # production leaves every rank idle at each group boundary.
                     epoch_start = (
                         start_parent % len(prompts) if epoch == first_epoch else 0
                     )
                     epoch_prompts = prompts.iter_epoch(
                         epoch, start_parent=epoch_start
                     )
-                    for prompt in epoch_prompts:
-                        controller.ingest_prompts([prompt])
+                    pending: list = []
+                    exhausted = False
+                    while not exhausted:
+                        while len(pending) < max(1, len(live_workers)):
+                            try:
+                                pending.append(next(epoch_prompts))
+                            except StopIteration:
+                                exhausted = True
+                                break
+                        if not pending:
+                            break
                         if not live_workers:
                             raise RuntimeError(
                                 "all rollout workers were dropped before windowed "
-                                f"parent {prompt.get('task_id')} could run"
+                                f"parent {pending[0].get('task_id')} could run"
                             )
+                        controller.ingest_prompts(pending)
+                        pending = []
                         run_epoch_workers(live_workers)
                         stopped = should_stop is not None and should_stop()
                         live_workers = [

@@ -226,6 +226,12 @@ class RuntimeConfig(StrictConfigModel):
     """Streaming bounds shared by unified disaggregated producer roles."""
 
     producer_lease: int = Field(default=8, gt=0)
+    # Windowed-online only: N rollout worker threads share the single capture
+    # server so N parents are captured concurrently (the blocking HTTP prefill
+    # releases the GIL). Each worker still leases one parent per run_once.
+    # Keep N small enough that N parent groups fit the spill budget and the
+    # in-flight watermark (group = children_per_parent child files).
+    producer_workers: Optional[int] = Field(default=None, ge=1)
     in_flight_high_watermark: int = Field(default=256, gt=0)
     in_flight_low_watermark: int = Field(default=192, ge=0)
     resident_high_watermark_bytes: Optional[int] = Field(default=None, gt=0)
@@ -754,6 +760,15 @@ class Config(StrictConfigModel):
                     "data.windowed_online requires runtime.producer_lease=1 so "
                     "only one parent is captured per worker lease"
                 )
+            if self.runtime.producer_workers is not None:
+                workers = int(self.runtime.producer_workers)
+                if workers * children > self.runtime.in_flight_high_watermark:
+                    raise ValueError(
+                        "runtime.producer_workers * children_per_parent must "
+                        "not exceed runtime.in_flight_high_watermark: "
+                        f"{workers} * {children} > "
+                        f"{self.runtime.in_flight_high_watermark}"
+                    )
             world_size = (
                 self.deployment.trainer.nnodes
                 * self.deployment.trainer.nproc_per_node
@@ -786,6 +801,11 @@ class Config(StrictConfigModel):
                     f"parent groups of {children} children; quantum={quantum}, "
                     f"misaligned={misaligned}"
                 )
+        elif self.runtime.producer_workers is not None:
+            raise ValueError(
+                "runtime.producer_workers is honored only with "
+                "data.windowed_online"
+            )
 
         if mode == "online" and deployment != "disaggregated":
             raise ValueError(

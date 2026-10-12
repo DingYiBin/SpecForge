@@ -777,7 +777,8 @@ def _build_online(
             if len(adapters) != 1:
                 raise ValueError(
                     "data.windowed_online currently requires exactly one capture "
-                    "server so parent publication remains strictly ordered"
+                    "server; scale producer concurrency with "
+                    "runtime.producer_workers (worker threads share the server)"
                 )
             from specforge.inference.adapters.windowed_capture import (
                 WindowedServerCaptureAdapter,
@@ -828,7 +829,16 @@ def _build_online(
             feature_store=store,
             channel=channel,
             feature_source=adapters if len(adapters) > 1 else adapters[0],
-            num_rollout_workers=len(adapters),
+            # Windowed online: N worker threads share the single wrapped
+            # capture-server adapter so N parents are captured concurrently;
+            # _assemble_server_rollout_workers replicates the single source
+            # across the workers. Non-windowed keeps one worker per server.
+            num_rollout_workers=(
+                cfg.runtime.producer_workers
+                if cfg.data.windowed_online is not None
+                and cfg.runtime.producer_workers is not None
+                else len(adapters)
+            ),
             run_id=cfg.run_id,
             target_hidden_size=hidden_size,
             target_vocab_size=target_vocab,
