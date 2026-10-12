@@ -1134,6 +1134,16 @@ def build_disagg_online_producer(
                     # to free spill files instead of burning the worker's
                     # failure budget. should_stop (consumer stopped/failed)
                     # still exits the loop at the top of the next round.
+                    # If no ref was EVER published, the consumer can never
+                    # make progress — waiting forever would be a deadlock, so
+                    # fail loudly instead.
+                    if state["produced"] == 0:
+                        raise RuntimeError(
+                            "feature-store backpressure before the first ref "
+                            "was published (consumer can never free space): "
+                            f"{exc}. If a previous attempt left spill files "
+                            "behind, clear the spill directory and restart."
+                        ) from exc
                     logger.warning(
                         "rollout worker %s paused on feature-store backpressure "
                         "(%s); waiting for consumer progress",

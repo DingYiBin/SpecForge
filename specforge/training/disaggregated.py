@@ -185,7 +185,28 @@ def _windowed_spill_store(cfg: Config, mooncake, *, producer: bool = False):
 
         run_dir = os.path.join(spill_root, cfg.run_id.replace(":", "__"))
         if os.path.isdir(run_dir):
-            shutil.rmtree(run_dir, ignore_errors=True)
+            orphan_files = 0
+            orphan_bytes = 0
+            for dirpath, _dirs, names in os.walk(run_dir):
+                for name in names:
+                    try:
+                        orphan_bytes += os.lstat(
+                            os.path.join(dirpath, name)
+                        ).st_size
+                        orphan_files += 1
+                    except OSError:
+                        pass
+            shutil.rmtree(run_dir)
+            if os.path.exists(run_dir):
+                raise RuntimeError(
+                    f"could not clear stale spill directory {run_dir}; "
+                    "remove it manually before starting the producer"
+                )
+            print(
+                "[producer-timing] cleared stale spill directory "
+                f"path={run_dir} files={orphan_files} bytes={orphan_bytes}",
+                flush=True,
+            )
     return WindowedFileSpillStore(
         mooncake,
         spill_root=spill_root,
