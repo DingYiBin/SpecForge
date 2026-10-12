@@ -87,10 +87,16 @@ class WindowedServerCaptureAdapter:
         child_tensors = {
             "input_ids": tokens,
             "loss_mask": loss_mask,
-            self.aux_feature: tensors[self.aux_feature][:, start:end].contiguous(),
+            # .clone(), NOT .contiguous(): a [1, start:end] slice of the
+            # [1, parent_len, ...] parent tensor is itself "contiguous" (the
+            # size-1 leading dim keeps the view dense), so .contiguous()
+            # returns the same view and torch.save would serialize the
+            # ENTIRE parent storage into every child file instead of just
+            # the 1024-token window.
+            self.aux_feature: tensors[self.aux_feature][:, start:end].clone(),
             self.last_hidden_feature: tensors[self.last_hidden_feature][
                 :, start:end
-            ].contiguous(),
+            ].clone(),
         }
         child_id = f"{parent.sample_id}:w{window_index:04d}"
         # Exclude the parent's "generation": the child's own put() assigns a

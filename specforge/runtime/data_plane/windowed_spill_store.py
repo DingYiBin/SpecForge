@@ -49,6 +49,7 @@ backpressure / hard-cap paths.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -62,6 +63,8 @@ from specforge.runtime.data_plane.feature_store import (
 )
 
 _FILE_URI_PREFIX = "file://"
+
+logger = logging.getLogger(__name__)
 
 # sample ids look like ``{run_id}:{parent_task_id}:{window}`` (e.g.
 # ``glm53-online:e000000-p...-src...:w0008``); ":" is not filesystem-safe.
@@ -189,7 +192,27 @@ class WindowedFileSpillStore:
         """Write one child sample to a spill file; return a ``file://`` ref."""
         if not tensors:
             raise ValueError("put requires at least one tensor")
-        staged = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
+        # Guard against views into a larger storage (e.g. a slice of a parent
+        # hidden state): torch.save serializes the WHOLE underlying storage of
+        # every tensor, so a small slice would silently write the full parent
+        # (~GBs) into the spill file. Materialize a minimal copy first.
+        staged = {}
+        for name, value in tensors.items():
+            t = value.detach().cpu()
+            own_bytes = t.numel() * t.element_size()
+            storage_bytes = t.untyped_storage().nbytes()
+            if storage_bytes > own_bytes:
+                logger.warning(
+                    "put(%s): tensor %r is a view into a %d-byte storage but "
+                    "only owns %d bytes; cloning to avoid serializing the "
+                    "shared storage",
+                    sample_id,
+                    name,
+                    storage_bytes,
+                    own_bytes,
+                )
+                t = t.clone()
+            staged[name] = t.contiguous()
         specs = {k: spec_from_tensor(k, v) for k, v in staged.items()}
         nbytes = sum(t.numel() * t.element_size() for t in staged.values())
         self._check_spill_budget(nbytes)
@@ -200,6 +223,19 @@ class WindowedFileSpillStore:
         # (never a half-written .ckpt the consumer could mmap).
         torch.save(staged, tmp)
         os.replace(tmp, path)
+        # Sanity check: the file on disk must match the claimed tensor bytes.
+        # A large mismatch means a shared/oversized storage leaked into the
+        # file and the spill budget is being consumed far faster than
+        # `estimated_bytes` suggests.
+        file_bytes = os.path.getsize(path)
+        if file_bytes > nbytes + (4 << 20):
+            logger.warning(
+                "spill file %s is %d bytes but its tensors only claim %d "
+                "bytes; oversized storage was serialized",
+                path,
+                file_bytes,
+                nbytes,
+            )
         return SampleRef(
             sample_id=sample_id,
             run_id=str(metadata.get("run_id", self.run_id)),
