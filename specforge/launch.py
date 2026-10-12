@@ -1048,6 +1048,10 @@ def build_disagg_online_producer(
         published_sizes = deque()
         last_publish_log = {"t": time.perf_counter()}
         dead: dict = {}  # worker_id -> last failure reason
+        # Set while the windowed prompt feeder may still deliver parents: an
+        # empty pool then means "top-up gap", not end-of-epoch, and workers
+        # must keep polling instead of treating it as drained.
+        prompt_feeder_live = threading.Event()
 
         def pool_drained() -> bool:
             st = controller.status()
@@ -1057,6 +1061,7 @@ def build_disagg_online_producer(
                 st["prompts_pending"] == 0
                 and st["prompts_leased"] == 0
                 and st["prompts_failed"] == 0
+                and not prompt_feeder_live.is_set()
             )
 
         def reconcile_consumed_locked() -> int:
@@ -1359,13 +1364,24 @@ def build_disagg_online_producer(
                         )
                     feed_stop = threading.Event()
                     feed_state: dict = {"error": None}
+                    # Raise the drain gate before the workers can observe the
+                    # pool: workers treat an empty pool as end-of-epoch, and
+                    # the feeder thread loses that start-up race every time
+                    # (both workers exit with produced=0 before the feeder's
+                    # first ingest lands).
+                    prompt_feeder_live.set()
+                    lookahead = max(1, len(live_workers))
+                    for _ in range(lookahead):
+                        try:
+                            controller.ingest_prompts([next(epoch_prompts)])
+                        except StopIteration:
+                            break
 
                     def feed_windowed_epoch() -> None:
                         try:
                             # Unleased-parent cap: the controller holds at
                             # most one leased + one pending parent payload per
                             # worker in memory.
-                            lookahead = max(1, len(live_workers))
                             for prompt in epoch_prompts:
                                 if feed_stop.is_set() or (
                                     should_stop is not None and should_stop()
@@ -1383,6 +1399,8 @@ def build_disagg_online_producer(
                                 controller.ingest_prompts([prompt])
                         except BaseException as exc:
                             feed_state["error"] = exc
+                        finally:
+                            prompt_feeder_live.clear()
 
                     feeder = threading.Thread(
                         target=feed_windowed_epoch,
