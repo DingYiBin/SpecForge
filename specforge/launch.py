@@ -975,6 +975,8 @@ def build_disagg_online_producer(
         """
         from collections import deque
 
+        import itertools
+
         drive_start = time.perf_counter()
         progress_interval = float(
             os.environ.get("DISAGG_PRODUCER_PROGRESS_INTERVAL", 30.0)
@@ -1085,13 +1087,159 @@ def build_disagg_online_producer(
             with publish_lock:
                 return reconcile_consumed_locked()
 
+        # Parent-order publication (windowed online resume correctness).
+        # Pipelined producer workers complete parent groups out of plan order,
+        # and publish-on-complete would let the trainer consume parent k+1's
+        # children before parent k's. A checkpoint saved inside such a swap
+        # window then resumes from a WRONG parent cursor — the windowed
+        # resume path derives its cursor purely from the step count
+        # (_windowed_resume_parent), so the consumed stream must stay a
+        # parent-plan prefix. Buffer completed groups by their ingest ordinal
+        # (the feeder walks the parent plan sequentially) and release only
+        # the in-order prefix. Every ingested ordinal deposits exactly once:
+        # a leased windowed task either commits its refs or the whole
+        # producer fails loudly (terminal prompt failure / dead worker), so
+        # the buffer cannot wedge behind a missing predecessor.
+        enforce_parent_order = bool(
+            getattr(prompts, "is_windowed_parent_plan", False)
+        )
+        plan_task_ordinal: dict = {}
+        plan_ordinal_counter = itertools.count()
+        reorder_state: dict = {"next": 0, "buffered": {}}
+
+        def record_plan_ordinals(task_ids) -> None:
+            for task_id in task_ids:
+                if task_id in plan_task_ordinal:
+                    raise RuntimeError(
+                        f"duplicate prompt ingest for task {task_id}"
+                    )
+                plan_task_ordinal[task_id] = next(plan_ordinal_counter)
+
+        def reorder_buffered_refs() -> int:
+            # Backpressure must see reorder-staged refs: they already hold
+            # spill/mooncake bytes and are one step from the consumer, even
+            # though the channel has not published them yet.
+            if not enforce_parent_order:
+                return 0
+            with publish_lock:
+                return sum(
+                    len(group) for group in reorder_state["buffered"].values()
+                )
+
+        def _publish_group_locked(refs, *, worker_id, run_once_start) -> None:
+            current_bytes = reconcile_consumed_locked()
+            ref_sizes = [max(0, int(ref.estimated_bytes or 0)) for ref in refs]
+            projected_bytes = current_bytes + sum(ref_sizes)
+            if (
+                feature_store_max_resident_bytes is not None
+                and projected_bytes > feature_store_max_resident_bytes
+            ):
+                cleanup_errors = []
+                for ref in refs:
+                    try:
+                        feature_store.abort(
+                            ref.sample_id,
+                            reason="producer-resident-byte-hard-cap",
+                        )
+                    except Exception as exc:
+                        cleanup_errors.append(
+                            f"{ref.sample_id}: {type(exc).__name__}: {exc}"
+                        )
+                message = (
+                    "producer feature-store hard cap exceeded: "
+                    f"projected={projected_bytes} > "
+                    f"limit={feature_store_max_resident_bytes} bytes"
+                )
+                if cleanup_errors:
+                    message += f"; cleanup errors={cleanup_errors}"
+                raise MemoryError(message)
+            _publish_refs_with_cleanup(
+                channel=channel,
+                feature_store=feature_store,
+                refs=refs,
+            )
+            published_sizes.extend(ref_sizes)
+            state["resident_bytes"] = projected_bytes
+            state["produced"] += len(refs)
+            now = time.perf_counter()
+            should_log = not state["first_ref_logged"]
+            should_log = should_log or (
+                progress_interval > 0
+                and now - last_publish_log["t"] >= progress_interval
+            )
+            if should_log:
+                st = controller.status()
+                producer_timing(
+                    "published refs "
+                    f"worker={worker_id} batch={len(refs)} "
+                    f"produced={state['produced']} "
+                    f"in_flight={channel.in_flight_remote()} "
+                    f"pending={st['prompts_pending']} "
+                    f"leased={st['prompts_leased']} "
+                    f"run_once_elapsed={elapsed(run_once_start)} "
+                    f"elapsed={elapsed(drive_start)}"
+                )
+                state["first_ref_logged"] = True
+                last_publish_log["t"] = now
+
+        def _deposit_refs_locked(refs, *, worker_id, run_once_start) -> None:
+            """Stage one committed batch; publish strictly in parent-plan order.
+
+            Callers hold ``publish_lock``. Non-windowed runs have no plan
+            ordinals and keep the historical publish-on-complete behavior.
+            """
+            if not enforce_parent_order:
+                _publish_group_locked(
+                    refs, worker_id=worker_id, run_once_start=run_once_start
+                )
+                return
+            grouped: dict = {}
+            for ref in refs:
+                task_id = ref.source_task_id
+                if task_id is None:
+                    raise RuntimeError(
+                        "parent-order publication requires source_task_id on "
+                        f"every ref; missing on {ref.sample_id}"
+                    )
+                grouped.setdefault(task_id, []).append(ref)
+            for task_id, group_refs in grouped.items():
+                ordinal = plan_task_ordinal.get(task_id)
+                if ordinal is None:
+                    raise RuntimeError(
+                        "parent-order publication: no plan ordinal for task "
+                        f"{task_id}; every windowed parent must be ingested "
+                        "through the windowed feeder"
+                    )
+                if ordinal in reorder_state["buffered"]:
+                    raise RuntimeError(
+                        "parent-order publication: duplicate completion for "
+                        f"plan ordinal {ordinal} (task {task_id})"
+                    )
+                reorder_state["buffered"][ordinal] = group_refs
+            while True:
+                group_refs = reorder_state["buffered"].pop(
+                    reorder_state["next"], None
+                )
+                if group_refs is None:
+                    return
+                # Advance past this ordinal BEFORE publishing: the hard-cap
+                # valve aborts the group's refs irrecoverably (backpressure,
+                # not a retry) — a stuck cursor would wedge every later
+                # parent behind permanently unpublished bytes.
+                reorder_state["next"] += 1
+                _publish_group_locked(
+                    group_refs,
+                    worker_id=worker_id,
+                    run_once_start=run_once_start,
+                )
+
         def run_worker(w) -> None:
             failures = 0
             last_backpressure_log = 0.0
             for _ in range(max_rounds):
                 if should_stop is not None and should_stop():
                     return
-                _infl = channel.in_flight_remote()
+                _infl = channel.in_flight_remote() + reorder_buffered_refs()
                 _resident = resident_bytes()
                 # backpressure: in_flight = published - consumer-acked
                 backpressure_started = time.monotonic()
@@ -1135,7 +1283,7 @@ def build_disagg_online_producer(
                             f"progress (in_flight={_infl})"
                         )
                     sleep(backpressure_poll_s)
-                    _infl = channel.in_flight_remote()
+                    _infl = channel.in_flight_remote() + reorder_buffered_refs()
                     _resident = resident_bytes()
                 try:
                     run_once_start = time.perf_counter()
@@ -1190,62 +1338,11 @@ def build_disagg_online_producer(
                 failures = 0
                 if refs:
                     with publish_lock:
-                        current_bytes = reconcile_consumed_locked()
-                        ref_sizes = [
-                            max(0, int(ref.estimated_bytes or 0)) for ref in refs
-                        ]
-                        projected_bytes = current_bytes + sum(ref_sizes)
-                        if (
-                            feature_store_max_resident_bytes is not None
-                            and projected_bytes > feature_store_max_resident_bytes
-                        ):
-                            cleanup_errors = []
-                            for ref in refs:
-                                try:
-                                    feature_store.abort(
-                                        ref.sample_id,
-                                        reason="producer-resident-byte-hard-cap",
-                                    )
-                                except Exception as exc:
-                                    cleanup_errors.append(
-                                        f"{ref.sample_id}: {type(exc).__name__}: {exc}"
-                                    )
-                            message = (
-                                "producer feature-store hard cap exceeded: "
-                                f"projected={projected_bytes} > "
-                                f"limit={feature_store_max_resident_bytes} bytes"
-                            )
-                            if cleanup_errors:
-                                message += f"; cleanup errors={cleanup_errors}"
-                            raise MemoryError(message)
-                        _publish_refs_with_cleanup(
-                            channel=channel,
-                            feature_store=feature_store,
-                            refs=refs,
+                        _deposit_refs_locked(
+                            refs,
+                            worker_id=w.worker_id,
+                            run_once_start=run_once_start,
                         )
-                        published_sizes.extend(ref_sizes)
-                        state["resident_bytes"] = projected_bytes
-                        state["produced"] += len(refs)
-                        now = time.perf_counter()
-                        should_log = not state["first_ref_logged"]
-                        should_log = should_log or (
-                            progress_interval > 0
-                            and now - last_publish_log["t"] >= progress_interval
-                        )
-                        if should_log:
-                            st = controller.status()
-                            producer_timing(
-                                "published refs "
-                                f"worker={w.worker_id} batch={len(refs)} "
-                                f"produced={state['produced']} "
-                                f"in_flight={channel.in_flight_remote()} "
-                                f"pending={st['prompts_pending']} "
-                                f"leased={st['prompts_leased']} "
-                                f"run_once_elapsed={elapsed(run_once_start)} "
-                                f"elapsed={elapsed(drive_start)}"
-                            )
-                            state["first_ref_logged"] = True
-                            last_publish_log["t"] = now
                 elif pool_drained():
                     producer_timing(
                         f"pool drained worker={w.worker_id} produced={state['produced']} "
@@ -1373,7 +1470,9 @@ def build_disagg_online_producer(
                     lookahead = max(1, len(live_workers))
                     for _ in range(lookahead):
                         try:
-                            controller.ingest_prompts([next(epoch_prompts)])
+                            record_plan_ordinals(
+                                controller.ingest_prompts([next(epoch_prompts)])
+                            )
                         except StopIteration:
                             break
 
@@ -1396,7 +1495,7 @@ def build_disagg_online_producer(
                                     ):
                                         return
                                     sleep(backpressure_poll_s)
-                                controller.ingest_prompts([prompt])
+                                record_plan_ordinals(controller.ingest_prompts([prompt]))
                         except BaseException as exc:
                             feed_state["error"] = exc
                         finally:
