@@ -338,6 +338,28 @@ class TestMooncakeFeatureStore(unittest.TestCase):
         self.assertEqual(fs.health()["force_freed_total"], 0)
         self.assertTrue(_phys_resident(fake))
 
+    def test_abort_then_adopt_same_generation_resurrects_retry_object(self):
+        # Server capture retries rewrite the SAME deterministic keys
+        # ("gen": 1, "replace": true). A rolled-back attempt marked the
+        # (sid, gen) freed; the retried write re-populated those keys, so
+        # adopt() must clear the freed marker or every retry would be
+        # refused as use-after-free.
+        fake = _FakeMooncakeStore()
+        fs = MooncakeFeatureStore(store=fake, store_id="run0")
+        ref = fs.put(_tensors(), sample_id="run0:p0", metadata=_meta())
+        gen = ref.metadata["generation"]
+        fs.abort("run0:p0")
+        self.assertFalse(_phys_resident(fake, sid="run0:p0"))
+
+        # The server retried: same (sid, gen) keys are physically back.
+        src = _tensors()
+        for name, t in src.items():
+            fs._store_put_tensor(fs._tkey("run0:p0", gen, name), t)
+        fs.adopt(ref)
+        tensors, handle = fs.get(ref)
+        self.assertEqual(set(tensors), set(ref.feature_keys))
+        fs.release(handle)
+
     def test_restart_authority_adopts_acked_remote_ref_before_removing(self):
         fake = _FakeMooncakeStore()
         producer = MooncakeFeatureStore(store=fake, store_id="run0")

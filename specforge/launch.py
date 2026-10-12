@@ -1128,6 +1128,20 @@ def build_disagg_online_producer(
                 try:
                     run_once_start = time.perf_counter()
                     refs = w.run_once(max_tasks=worker_lease)
+                except MemoryError as exc:
+                    # Spill-budget backpressure, not a worker defect: the
+                    # leases were failed retryable, so wait for the consumer
+                    # to free spill files instead of burning the worker's
+                    # failure budget. should_stop (consumer stopped/failed)
+                    # still exits the loop at the top of the next round.
+                    logger.warning(
+                        "rollout worker %s paused on feature-store backpressure "
+                        "(%s); waiting for consumer progress",
+                        w.worker_id,
+                        exc,
+                    )
+                    sleep(backpressure_poll_s)
+                    continue
                 except Exception as exc:
                     # the worker already failed its leases retryable; peers
                     # (or this worker, next round) will re-lease them.

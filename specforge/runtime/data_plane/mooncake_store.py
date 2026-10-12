@@ -440,6 +440,13 @@ class MooncakeFeatureStore(FeatureStore):
             )
         with self._lock:
             gen = int(gen)
+            # Server capture rewrites the SAME deterministic keys on a retry
+            # ("gen": 1, "replace": true). If an earlier attempt of this task
+            # was rolled back (abort marked (sid, gen) freed), the retry's
+            # fresh server write has re-populated those keys — clear the
+            # stale freed marker or get() would refuse the retried object as
+            # use-after-free forever.
+            self._freed.discard((sample_ref.sample_id, gen))
             self._generation[sample_ref.sample_id] = gen
             self._sample_names[sample_ref.sample_id] = list(
                 sample_ref.feature_keys.keys()

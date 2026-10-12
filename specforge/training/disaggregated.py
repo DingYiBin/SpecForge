@@ -156,7 +156,7 @@ def _mooncake_store(cfg: Config, *, retain_on_release: bool = False):
     )
 
 
-def _windowed_spill_store(cfg: Config, mooncake):
+def _windowed_spill_store(cfg: Config, mooncake, *, producer: bool = False):
     """A' data plane for windowed online: Mooncake parents + spill-file children.
 
     Requires ``deployment.disaggregated.spill_root``; the producer and all
@@ -176,6 +176,16 @@ def _windowed_spill_store(cfg: Config, mooncake):
         WindowedFileSpillStore,
     )
 
+    if producer:
+        # Fresh-attempt semantics, same as control_dir: a crashed/failed
+        # attempt leaves orphaned child files behind (its rollback never
+        # ran), and those would poison the spill budget of every retry.
+        # Only the producer writes children, so only it clears the run dir.
+        import shutil
+
+        run_dir = os.path.join(spill_root, cfg.run_id.replace(":", "__"))
+        if os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
     return WindowedFileSpillStore(
         mooncake,
         spill_root=spill_root,
@@ -646,7 +656,9 @@ def _build_online(
         # A' data plane: parents stay on Mooncake (server -> producer, once),
         # children become spill files under the shared spill_root so trainer
         # ranks mmap them locally instead of crossing the wire per child.
-        store = _windowed_spill_store(cfg, store)
+        store = _windowed_spill_store(
+            cfg, store, producer=cfg.training.role == "producer"
+        )
     from specforge.runtime.data_plane.feature_store import drain_feature_store_removals
     from specforge.runtime.data_plane.streaming_ref_channel import StreamingRefChannel
 
