@@ -193,7 +193,15 @@ def _resolve_role(
         if disaggregated and legacy_role in ("producer", "consumer"):
             requested = legacy_role
         elif disaggregated and cfg.training.resume_from:
-            requested = "consumer"
+            # Windowed-online resume is checkpoint-driven: the producer
+            # replays from the checkpoint's parent cursor into fresh attempt
+            # paths, so auto-spawning it beside the consumer is safe and keeps
+            # the one-command UX. Other online producers have no replay
+            # cursor and would silently re-capture the entire plan, so they
+            # stay an explicit per-role decision.
+            requested = (
+                "both" if cfg.data.windowed_online is not None else "consumer"
+            )
         else:
             requested = "both" if disaggregated else "all"
 
@@ -201,7 +209,11 @@ def _resolve_role(
         raise ValueError("disaggregated training does not support --role all")
     if not disaggregated and requested != "all":
         raise ValueError("--role producer/consumer/both requires disaggregated mode")
-    if requested == "both" and cfg.training.resume_from:
+    if (
+        requested == "both"
+        and cfg.training.resume_from
+        and cfg.data.windowed_online is None
+    ):
         raise ValueError(
             "--role both cannot resume a disaggregated producer; use " "--role consumer"
         )

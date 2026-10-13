@@ -1055,6 +1055,67 @@ class LaunchPlanTest(unittest.TestCase):
                 env=MOONCAKE_ENV,
             )
 
+    @staticmethod
+    def _windowed_online_config(*, resume=False):
+        cfg = _config(mode="disaggregated")
+        raw = cfg.model_dump()
+        raw["data"] = {
+            "parent_bin_path": "/data/tokens.bin",
+            "windowed_online": {
+                "child_length": 1024,
+                "overlap": 128,
+                "children_per_parent": 48,
+            },
+        }
+        raw["deployment"]["disaggregated"]["producer_segment_size"] = 1024
+        if resume:
+            raw["training"]["resume_from"] = "/checkpoint/latest"
+        return Config.model_validate(raw)
+
+    def test_windowed_resume_auto_spawns_both_roles(self):
+        # Windowed-online resume is checkpoint-driven (start_parent replay
+        # into fresh attempt paths), so --role auto keeps the one-command UX
+        # instead of dropping to consumer-only.
+        plan = build_launch_plan(
+            self._windowed_online_config(resume=True),
+            config_path="run.yaml",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(plan.role, "both")
+        self.assertEqual(
+            [command.role for command in plan.commands],
+            ["producer", "consumer"],
+        )
+
+    def test_windowed_resume_allows_explicit_both(self):
+        plan = build_launch_plan(
+            self._windowed_online_config(resume=True),
+            config_path="run.yaml",
+            requested_role="both",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(plan.role, "both")
+
+    def test_windowed_resume_keeps_explicit_consumer(self):
+        # The manual escape hatch is unchanged: --role consumer still resumes
+        # without spawning a producer.
+        plan = build_launch_plan(
+            self._windowed_online_config(resume=True),
+            config_path="run.yaml",
+            requested_role="consumer",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(plan.role, "consumer")
+
+    def test_windowed_fresh_run_still_spawns_both_roles(self):
+        # Regression: a fresh windowed run never drops to consumer-only.
+        plan = build_launch_plan(
+            self._windowed_online_config(resume=False),
+            config_path="run.yaml",
+            env=MOONCAKE_ENV,
+        )
+        self.assertEqual(plan.role, "both")
+
     def test_managed_supervisor_starts_services_by_phase_and_stops_in_reverse(self):
         events = []
         mooncake = _FakeProcess([None], label="mooncake", events=events)
