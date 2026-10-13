@@ -729,8 +729,15 @@ def _build_online(
             if cfg.training.resume_from is not None:
                 from specforge.training.checkpoint import CheckpointManager
 
+                # The windowed producer replay only needs the checkpoint's
+                # counters and the windowed_online_data contract to compute
+                # start_parent; it never restores optimizer/backend state. It
+                # runs as a single process (world_size=1), so the default
+                # require_full_state=True would wrongly reject a checkpoint
+                # whose per-rank shards were written at trainer world_size=N.
                 resume_state = CheckpointManager.read_resume_state(
-                    cfg.training.resume_from
+                    cfg.training.resume_from,
+                    require_full_state=False,
                 )
                 start_parent = _windowed_resume_parent(
                     cfg, prompts, resume_state
